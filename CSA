@@ -1,0 +1,128 @@
+# Compliance and security audit
+
+TORN Daily Resource Tracker 1.0.0. Audit date: 2 October 2026.
+Scope: `torn-daily-resource-tracker.user.js`, the exact file delivered.
+
+## 1. Sources checked
+
+* **Torn API documentation** (`https://www.torn.com/api.html`):
+  * the API is read-only;
+  * 100 requests per minute per user, across all keys;
+  * how the ToS table must be shown;
+  * error codes;
+  * the 30-second service cache and the `timestamp` parameter that bypasses it;
+  * the `comment` parameter;
+  * repeated requests with invalid keys can trigger temporary IP blocks.
+* **Torn API v2 OpenAPI spec 6.13.4** (September 2026). Every endpoint, selection, stat name and response field the script reads was checked against it, including the access level each one needs.
+* **Torn wiki:**
+  * City: maximum 100 items per day from East Side shops.
+  * Casino: 75 tokens at New Day.
+  * Points: each refill once per day, resetting at New Day.
+  * Organized Crime 2.0: every member must be in Torn and not hospitalized when the crime starts.
+  * Travel: 3% flight variance; travel times changed in June 2026.
+  * Activity Log.
+* **Torn's scripting rule**, as publicly quoted. Scripts may only use API data or data from a page the user loaded manually and is viewing. They may not make extra non-API requests, scrape pages that are not being viewed, or bypass the CAPTCHA.
+* **Not loaded directly:** `https://www.torn.com/rules.php` blocks automated access. Read it yourself before publishing (see section 9).
+
+## 2. Network endpoints (complete list)
+
+| # | Request | Purpose | Key access | When |
+|---|---|---|---|---|
+| 1 | `GET https://api.torn.com/v2/key/info` | Learn the key's access level and allowed selections, so only permitted data is requested | Any key | At start, after a key change, every 6 h |
+| 2 | `GET https://api.torn.com/v2/user?selections=bars,cooldowns,refills,travel,organizedcrime,timestamp[,casino]&legacy=refills&timestamp=<now>` | Live data and Torn server time (see notes below the table) | Minimal (Limited for casino) | Every 30, 60 or 120 s (60 s default); New Day +3 s and +35 s; manual refresh at most once per 10 s |
+| 3 | `GET https://api.torn.com/v2/user/personalstats?stat=xantaken,cityitemsbought,refills,nerverefills,tokenrefills` | Counters for Xanax, City Shop and refill confirmation | Public or higher | Every 2 min |
+| 4 | Same as #3 with `&timestamp=<00:00 TCT minus 1 s>` | Torn's historical value as the New Day baseline | Public or higher | Only when needed, at most 3 per day |
+| 5 | `GET https://api.torn.com/v2/user/log?from=&to=&limit=100` | Activity log for the energy and nerve breakdown, and confirmation of Xanax and City Shop | Full, or custom with `log` | Every 2 min, only new entries; at most 15 pages per pass; yesterday's last minutes once more after New Day |
+
+Notes on request #2:
+* `casino` is only requested with a Limited or higher key.
+* `legacy=refills` asks for the explicit `*_refill_used` fields.
+* The `timestamp` query parameter bypasses Torn's 30-second cache.
+
+How every request is sent:
+* Method GET, with browser credentials omitted.
+* Tagged `comment=TRTracker`.
+* One queue: at most 20 requests per minute, duplicates merged while in flight, 15-second timeout.
+* Retries with backoff for network or backend errors only.
+* Only one Torn tab sends requests; the others read the shared results.
+
+Typical steady load: about 1.5 requests per minute with a Limited key and about 2 with a Full key. Hidden tabs poll three times slower.
+
+**Links**, opened only when you click them, in a new tab with `noopener noreferrer`:
+* The author's profile (support message).
+* Torn's API key settings page.
+
+**Nothing else:** no remote scripts, fonts, images, analytics, telemetry, proxies or third-party servers.
+
+## 3. Page data
+
+* **Travel page only** (`travelagency.php` or `page.php?sid=travel`), while you are viewing it. The script reads the `data-model` attribute of `#travel-root` and the checked travel type and destination inputs. It is read-only, and the MutationObserver only watches that element.
+* **Theme:** reads the `dark-mode` class on Torn's `body`.
+* **DOM changes:** the script adds one `<style id="trt-style">` and one `<div id="trt-root">`. Torn's own elements are never modified, hidden, clicked or blocked.
+
+## 4. Automation audit
+
+Each item below was checked against the source (see also the static tests in section 5).
+
+| Action | Present? |
+|---|---|
+| Auto-attack, auto-travel, destination selection, travel blocking or cancelling | No |
+| Using Xanax, drugs, boosters, medical items or refills | No |
+| City Shop purchases | No |
+| Casino play | No |
+| Joining, accepting or cancelling an OC | No |
+| Clicking Torn's gameplay buttons, simulating input, submitting forms, `dispatchEvent` | No |
+| CAPTCHA interaction | No |
+| Reading pages that are not being viewed, hidden iframes, non-API Torn requests | No |
+| Analytics, telemetry, sending the key to third parties | No |
+
+The only programmatic `.click()` is on a temporary link the script creates for **Export data > Download file**, and only after you press that button.
+
+**Third-party code:** none. Public userscripts were read only to learn which Torn fields exist; no code was copied, so no attribution is required.
+
+## 5. Automated security scan
+
+These checks run in `static.test.js` against the shipped file. Result: 13 of 13 passed.
+
+* No `eval`, `Function` constructor, `atob`/`btoa` payloads, iframes, WebSocket, `sendBeacon`, `XMLHttpRequest`, `document.write`, dynamic `import()` or string timers.
+* Every URL in the source is on an allow-list: the API base, the profile link, the API settings link and metadata URLs.
+* Exactly one `fetch(` call site. It builds its URL from `API_BASE` and uses `credentials: 'omit'`.
+* The declared `@grant` lines equal the GM functions actually used: `GM_getValue`, `GM_setValue`, `GM_deleteValue`, `GM_registerMenuCommand`. There is no `@connect`, because `fetch` needs none.
+* The source is pure ASCII, because TornPDA rewrites curly quotes. The only console call is the opt-in debug logger, which is off by default and redacts keys.
+* The support link has `target="_blank"` and `rel="noopener noreferrer"` and makes no request.
+* Every fixture the tests use validates against the official schema. One correction was applied: Torn's spec declares selection names as `oneOf` of two string schemas that overlap, so real values can never validate. The test treats it as `anyOf`.
+
+## 6. API key handling
+
+* **Stored locally:**
+  * userscript storage in Tampermonkey and Violentmonkey;
+  * the app's storage on TornPDA, where the key is injected by TornPDA itself;
+  * `localStorage` with a `trt:` prefix on managers without synchronous GM storage.
+* **Sent only** as the `key` parameter to `https://api.torn.com/v2` over HTTPS. As with every Torn userscript, it is visible in your own browser's developer-tools network panel.
+* **Never** logged, never rendered in full (only the last 4 characters are shown), never exported.
+* **Rejected keys** stop all requests immediately. This covers keys that are rejected, paused, inactive, or belong to a player in federal jail. The rejection is remembered by a non-reversible fingerprint until you change the key or press Try again, which follows Torn's guidance on invalid keys.
+
+## 7. Statements and claims
+
+* The privacy statement in Settings and the README matches the implementation. The tests check it: no key in the page, console or other storage; no requests except to the API; no page loads.
+* The compliance statement is the required wording.
+* The key prompt and the ToS table ask for a Full Access key and say why: energy and nerve usage come only from the activity log, which Torn shares only with Full Access keys. Smaller keys keep working for every other feature, so Full Access is requested with a stated reason, never forced.
+* The script never claims to be safe from bans. It says "Designed around Torn's published API and scripting rules."
+
+## 8. Accuracy policy
+
+* Numbers are only shown as verified when Torn data proves them.
+* Unknown values are shown as a dash or "?", never as 0.
+* Partial knowledge is shown as a range or a minimum.
+* Values that are not refreshed after New Day are marked "Checking after New Day" or STALE.
+
+## 9. Before publishing (manual checklist)
+
+1. Re-read `https://www.torn.com/rules.php` and `https://www.torn.com/api.html`.
+2. Install in Tampermonkey with a real Limited key. In Torn's API key log, confirm that only the endpoints in section 2 appear, tagged TRTracker.
+3. Check the three refill states against the Points Building. This confirms the `legacy=refills` format on the live API.
+4. With a Full key, compare "Energy used today" with your activity log after a day with gym trains and attacks. Confirm that Xanax and City Shop show ✓.
+5. Open the Travel page. Confirm the Travel page block appears and that Torn's flag matches Torn's own travel warning.
+6. Keep a tab open over one New Day (00:00 TCT). Check the archive in Settings > Your data.
+7. Install on TornPDA and on a phone browser.
+8. Raise `@version` and add a CHANGELOG entry for every release.
