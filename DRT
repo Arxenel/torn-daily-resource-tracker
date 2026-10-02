@@ -2,7 +2,7 @@
 // @name         TORN Daily Resource Tracker
 // @namespace    https://torn.com/
 // @version      1.0.0
-// @description  Compact daily Energy, Nerve, Xanax, City Shop, Casino Token, refill, cooldown, Organized Crime and travel/OC tracker for Torn City. Read-only, uses the official Torn API. Needs a Full Access API key for all features, including energy and nerve usage.
+// @description  Stop guessing your daily progress. Track Energy, Nerve, Xanax, City Shop, Casino Tokens, refills, cooldowns, Organized Crimes and travel/OC timing in one compact dashboard. Especially useful for faction daily requirements. Read-only, uses the official Torn API. Needs a Full Access API key for all features, including energy and nerve usage.
 // @author       Arxenel [4390395]
 // @match        https://www.torn.com/*
 // @grant        GM_getValue
