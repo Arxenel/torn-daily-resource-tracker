@@ -1,0 +1,2565 @@
+// ==UserScript==
+// @name         TORN Daily Resource Tracker
+// @namespace    https://torn.com/
+// @version      1.0.0
+// @description  Compact daily Energy, Nerve, Xanax, City Shop, Casino Token, refill, cooldown, Organized Crime and travel/OC tracker for Torn City. Read-only, uses the official Torn API. Needs a Full Access API key for all features, including energy and nerve usage.
+// @author       Arxenel [4390395]
+// @match        https://www.torn.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
+// @noframes
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+/*
+ * TORN Daily Resource Tracker
+ * One small movable window that remembers your Torn day for you.
+ *
+ * - Read-only. It never clicks, buys, travels, attacks, refills, plays the
+ *   Casino or uses items. It only displays information.
+ * - Network: talks only to Torn's official API (https://api.torn.com/v2).
+ * - Page data: reads the Travel page model only while you are viewing it.
+ * - Daily reset follows Torn City Time (UTC), never your local clock.
+ * - Needs a Full Access API key for every feature: energy and nerve usage
+ *   come only from your Torn activity log, which Torn shares only with
+ *   Full Access keys. Smaller keys still work, without those two.
+ * - Your API key and history stay in this browser. No analytics.
+ *
+ * MIT License. Copyright (c) 2026 Arxenel [4390395]
+ *
+ * Recreating or modifying this script? Please don't forget to credit the
+ * original author, Arxenel [4390395]:
+ * https://www.torn.com/profiles.php?XID=4390395
+ * The MIT license also requires this copyright notice to stay in every
+ * copy or modified version.
+ */
+(function () {
+  'use strict';
+
+  if (window.top !== window.self) return;
+  if (document.getElementById('trt-root')) return;
+
+  // ===========================================================================
+  // CONSTANTS
+  // ===========================================================================
+  const TRT_VERSION = '1.0.0';
+  const API_BASE = 'https://api.torn.com/v2';
+  const API_COMMENT = 'TRTracker'; // Torn shows max 10 chars of the comment in your API log
+  const SUPPORT = { name: 'Arxenel', id: 4390395, url: 'https://www.torn.com/profiles.php?XID=4390395' };
+  const TORN_API_SETTINGS_URL = 'https://www.torn.com/preferences.php#tab=api';
+  const DAY_MS = 86400000;
+  const CITY_DAILY_ALLOWANCE = 100; // Torn wiki "City": 100 items per day from East Side shops
+  const CASINO_DAILY_BASE = 75;     // Torn wiki "Casino": 75 tokens received at New Day
+  const COUNTER_STATS = ['xantaken', 'cityitemsbought', 'refills', 'nerverefills', 'tokenrefills'];
+  // TornPDA replaces this placeholder with the user's key. The check below never
+  // contains the literal placeholder text, so it survives PDA's replacement.
+  const PDA_KEY = '###PDA-APIKEY###';
+
+  // ===========================================================================
+  // UTILITIES
+  // ===========================================================================
+  const U = {
+    isNum(v) { return typeof v === 'number' && Number.isFinite(v); },
+    clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); },
+    pad2(n) { return (n < 10 ? '0' : '') + n; },
+    esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    },
+    int(n) {
+      if (!U.isNum(n)) return '?';
+      return Math.round(n).toLocaleString('en-US');
+    },
+    // 04:21:33 (or 1d 04:21:33)
+    hms(ms) {
+      if (!U.isNum(ms)) return '--:--:--';
+      let s = Math.max(0, Math.ceil(ms / 1000));
+      const d = Math.floor(s / 86400); s -= d * 86400;
+      const h = Math.floor(s / 3600); s -= h * 3600;
+      const m = Math.floor(s / 60); s -= m * 60;
+      const core = U.pad2(h) + ':' + U.pad2(m) + ':' + U.pad2(s);
+      return d > 0 ? d + 'd ' + core : core;
+    },
+    // 1d 06h / 2h 14m / 14m / 45s
+    short(ms) {
+      if (!U.isNum(ms)) return '?';
+      let s = Math.max(0, Math.ceil(ms / 1000));
+      const d = Math.floor(s / 86400); s -= d * 86400;
+      const h = Math.floor(s / 3600); s -= h * 3600;
+      const m = Math.floor(s / 60); s -= m * 60;
+      if (d > 0) return d + 'd ' + U.pad2(h) + 'h';
+      if (h > 0) return h + 'h ' + U.pad2(m) + 'm';
+      if (m > 0) return m + 'm';
+      return s + 's';
+    },
+    // 1d 06h 22m / 2h 14m / 14m 05s
+    long(ms) {
+      if (!U.isNum(ms)) return '?';
+      let s = Math.max(0, Math.ceil(ms / 1000));
+      const d = Math.floor(s / 86400); s -= d * 86400;
+      const h = Math.floor(s / 3600); s -= h * 3600;
+      const m = Math.floor(s / 60); s -= m * 60;
+      if (d > 0) return d + 'd ' + U.pad2(h) + 'h ' + U.pad2(m) + 'm';
+      if (h > 0) return h + 'h ' + U.pad2(m) + 'm';
+      return m + 'm ' + U.pad2(s) + 's';
+    },
+    ago(ms) {
+      if (!U.isNum(ms)) return 'never';
+      const s = Math.max(0, Math.round(ms / 1000));
+      if (s < 60) return s + 's ago';
+      if (s < 3600) return Math.floor(s / 60) + 'm ago';
+      if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+      return Math.floor(s / 86400) + 'd ago';
+    },
+    uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4); },
+    deepMerge(base, over) {
+      if (!over || typeof over !== 'object' || Array.isArray(over)) return base;
+      const out = Array.isArray(base) ? base.slice() : Object.assign({}, base);
+      for (const k of Object.keys(over)) {
+        const bv = base ? base[k] : undefined;
+        const ov = over[k];
+        if (bv && typeof bv === 'object' && !Array.isArray(bv) && ov && typeof ov === 'object' && !Array.isArray(ov)) {
+          out[k] = U.deepMerge(bv, ov);
+        } else if (ov !== undefined) {
+          out[k] = ov;
+        }
+      }
+      return out;
+    },
+    clone(o) { return JSON.parse(JSON.stringify(o)); },
+    // Removes the API key from any string before it can reach a log or the UI.
+    redact(s) {
+      return String(s == null ? '' : s).replace(/([?&]key=)[^&#\s]+/gi, '$1[redacted]').replace(/\b[A-Za-z0-9]{16}\b/g, (m) => (/\d/.test(m) && /[A-Za-z]/.test(m) ? '[redacted]' : m));
+    },
+    log(...args) {
+      // Debug output is off by default; it never prints the key (args are redacted).
+      if (!U.debug) return;
+      try { console.log('[TRT]', ...args.map((a) => (typeof a === 'string' ? U.redact(a) : a))); } catch (e) { /* ignore */ }
+    },
+    debug: false,
+  };
+
+  const hasPdaKey = () => typeof PDA_KEY === 'string' && /^[A-Za-z0-9]{16}$/.test(PDA_KEY);
+
+  // ===========================================================================
+  // STORAGE  (userscript storage; falls back to localStorage with a trt: prefix)
+  // ===========================================================================
+  const Store = (() => {
+    const PREFIX = 'trt:';
+    const gm = (typeof GM_getValue === 'function' && typeof GM_setValue === 'function');
+    const backend = gm ? 'userscript' : 'localStorage';
+    function readRaw(k) {
+      if (gm) return GM_getValue(PREFIX + k, undefined);
+      return window.localStorage.getItem(PREFIX + k);
+    }
+    function get(k, def) {
+      try {
+        const raw = readRaw(k);
+        if (raw === undefined || raw === null) return def;
+        if (typeof raw !== 'string') return raw; // legacy structured values
+        return JSON.parse(raw);
+      } catch (e) { return def; }
+    }
+    function set(k, v) {
+      try {
+        const s = JSON.stringify(v);
+        if (gm) GM_setValue(PREFIX + k, s); else window.localStorage.setItem(PREFIX + k, s);
+        return true;
+      } catch (e) { U.log('storage write failed', k); return false; }
+    }
+    function del(k) {
+      try {
+        if (gm && typeof GM_deleteValue === 'function') GM_deleteValue(PREFIX + k);
+        else if (gm) GM_setValue(PREFIX + k, undefined);
+        else window.localStorage.removeItem(PREFIX + k);
+      } catch (e) { /* ignore */ }
+    }
+    return { get, set, del, backend };
+  })();
+
+  // ===========================================================================
+  // SETTINGS
+  // ===========================================================================
+  const DEFAULT_SETTINGS = {
+    v: 1,
+    goals: { energy: 500, nerve: 100, xanax: 3, city: 100, casino: 75 }, // null = OFF
+    energyFormat: 'goal', // 'goal' -> 650/500 when a goal is set, 'plain' -> 650 E
+    compact: {
+      energy: true, nerve: true, xanax: true, city: true, casino: true, oc: true,
+      travel: false, drug: false, booster: false, medical: false, newDay: false,
+    },
+    modules: {
+      energy: true, energyBreakdown: true, nerve: true, nerveBreakdown: true, xanax: true,
+      city: true, casino: true, refills: true, drugCd: true, boosterCd: true, medicalCd: true,
+      oc: true, travel: true, goalProgress: true, confidence: true, newDay: true, support: true,
+    },
+    ui: { state: 'collapsed', scale: 100, corner: 'top-right', pos: null },
+    travel: { stayMinutes: 0, bufferMinutes: 15 },
+    refresh: { coreSec: 60 },
+    useLogs: true,
+  };
+
+  const Settings = (() => {
+    let cur = load();
+    const subs = [];
+    function sanitizeGoal(v, max) {
+      if (v === null || v === 'off' || v === '') return null;
+      const n = Math.round(Number(v));
+      if (!Number.isFinite(n) || n < 1) return null;
+      return Math.min(n, max);
+    }
+    function sanitize(s) {
+      const out = U.deepMerge(DEFAULT_SETTINGS, s || {});
+      const g = out.goals;
+      g.energy = sanitizeGoal(g.energy, 100000);
+      g.nerve = sanitizeGoal(g.nerve, 100000);
+      g.xanax = sanitizeGoal(g.xanax, 1000);
+      g.city = sanitizeGoal(g.city, 100000);
+      g.casino = sanitizeGoal(g.casino, 100000);
+      if (!['goal', 'plain'].includes(out.energyFormat)) out.energyFormat = 'goal';
+      if (!['collapsed', 'expanded', 'hidden'].includes(out.ui.state)) out.ui.state = 'collapsed';
+      out.ui.scale = [80, 90, 100, 110, 120].includes(Number(out.ui.scale)) ? Number(out.ui.scale) : 100;
+      if (!['top-left', 'top-right', 'bottom-left', 'bottom-right', 'custom'].includes(out.ui.corner)) out.ui.corner = 'top-right';
+      const p = out.ui.pos;
+      if (p && !(['left', 'right'].includes(p.h) && ['top', 'bottom'].includes(p.v) && U.isNum(p.x) && U.isNum(p.y))) out.ui.pos = null;
+      if (out.ui.corner === 'custom' && !out.ui.pos) out.ui.corner = 'top-right';
+      out.travel.stayMinutes = U.clamp(Math.round(Number(out.travel.stayMinutes) || 0), 0, 1440);
+      out.travel.bufferMinutes = U.clamp(Math.round(Number(out.travel.bufferMinutes) || 0), 0, 720);
+      out.refresh.coreSec = [30, 60, 120].includes(Number(out.refresh.coreSec)) ? Number(out.refresh.coreSec) : 60;
+      out.useLogs = out.useLogs !== false;
+      for (const k of Object.keys(out.compact)) out.compact[k] = !!out.compact[k];
+      for (const k of Object.keys(out.modules)) out.modules[k] = !!out.modules[k];
+      out.v = 1;
+      return out;
+    }
+    function load() { return sanitize(Store.get('settings', null)); }
+    function get() { return cur; }
+    function update(mut, opts) {
+      const next = U.clone(cur);
+      mut(next);
+      cur = sanitize(next);
+      Store.set('settings', cur);
+      if (!opts || !opts.silent) subs.forEach((f) => { try { f(cur); } catch (e) { U.log('settings sub', e); } });
+      return cur;
+    }
+    function reload() { cur = load(); subs.forEach((f) => { try { f(cur); } catch (e) { /* ignore */ } }); }
+    function reset() { cur = sanitize(null); Store.set('settings', cur); subs.forEach((f) => f(cur)); }
+    function onChange(f) { subs.push(f); }
+    return { get, update, reload, reset, onChange, sanitize };
+  })();
+  // ===========================================================================
+  // TCT TIME ENGINE
+  // Torn City Time is UTC. The engine derives "now" from Torn's server
+  // timestamp (API 'timestamp' selection) and only falls back to the local
+  // clock (read in UTC, never local time) until the first server sync.
+  // ===========================================================================
+  const Time = (() => {
+    const samples = [];
+    let offset = 0;            // serverMs - localMs
+    let source = 'local-utc';  // 'torn-api' | 'torn-api-cached' | 'local-utc'
+    let lastSyncAt = 0;
+    let anchorDate = Date.now();
+    let anchorPerf = perfNow();
+    let jumpListeners = [];
+
+    function perfNow() {
+      return (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : Date.now();
+    }
+    function restore(meta) {
+      const t = meta && meta.time;
+      if (t && U.isNum(t.offset) && U.isNum(t.at) && Date.now() - t.at < DAY_MS && Math.abs(t.offset) < 7 * DAY_MS) {
+        offset = t.offset; source = 'torn-api-cached'; lastSyncAt = t.at;
+      }
+    }
+    // serverSec: Torn server unix time (seconds); sentAt/recvAt: local ms around the request
+    function syncFromServer(serverSec, sentAt, recvAt) {
+      if (!U.isNum(serverSec) || serverSec < 1.5e9) return false;
+      const rtt = Math.max(0, recvAt - sentAt);
+      if (rtt > 15000) return false;
+      const est = serverSec * 1000 + 500 - (sentAt + rtt / 2); // server second is truncated -> +500ms
+      samples.push(est);
+      while (samples.length > 7) samples.shift();
+      const sorted = samples.slice().sort((a, b) => a - b);
+      offset = sorted[Math.floor(sorted.length / 2)];
+      source = 'torn-api';
+      lastSyncAt = recvAt;
+      return true;
+    }
+    function now() { return Date.now() + offset; }
+    function dayStart(ts) { return Math.floor(ts / DAY_MS) * DAY_MS; }
+    function nextNewDay(ts) { return dayStart(ts) + DAY_MS; }
+    function dateKey(ts) {
+      const d = new Date(ts);
+      return d.getUTCFullYear() + '-' + U.pad2(d.getUTCMonth() + 1) + '-' + U.pad2(d.getUTCDate());
+    }
+    function prevDateKey(key) { return dateKey(Date.parse(key + 'T00:00:00Z') - DAY_MS); }
+    function currentDateKey() { return dateKey(now()); }
+    function untilNewDay() { const n = now(); return nextNewDay(n) - n; }
+    function dayFraction() { const n = now(); return (n - dayStart(n)) / DAY_MS; }
+    // Detects local clock changes or system sleep: wall clock and monotonic clock disagree.
+    function checkJump() {
+      const d = Date.now(); const p = perfNow();
+      const diff = (d - anchorDate) - (p - anchorPerf);
+      anchorDate = d; anchorPerf = p;
+      if (Math.abs(diff) > 3000) {
+        if (source === 'torn-api') source = 'torn-api-cached';
+        jumpListeners.forEach((f) => { try { f(diff); } catch (e) { /* ignore */ } });
+        return true;
+      }
+      return false;
+    }
+    function onJump(f) { jumpListeners.push(f); }
+    function info() { return { offset, source, lastSyncAt, samples: samples.length }; }
+    // The ledger is only written once "now" comes from Torn (or Torn has
+    // answered without a timestamp, in which case UTC is the documented fallback).
+    function trusted() { return source !== 'local-utc'; }
+    function acceptLocal() { if (source === 'local-utc') source = 'local-utc-fallback'; }
+    function persistable() { return { offset, at: lastSyncAt }; }
+    function fmtTct(ts) {
+      const d = new Date(ts);
+      return U.pad2(d.getUTCHours()) + ':' + U.pad2(d.getUTCMinutes()) + ':' + U.pad2(d.getUTCSeconds());
+    }
+    // Test hook: lets the test-suite inject a fake offset.
+    function _setOffset(ms, src) { offset = ms; source = src || 'torn-api'; }
+    return {
+      restore, syncFromServer, now, dayStart, nextNewDay, dateKey, prevDateKey, currentDateKey,
+      untilNewDay, dayFraction, checkJump, onJump, info, persistable, fmtTct, _setOffset, trusted, acceptLocal,
+    };
+  })();
+
+  // ===========================================================================
+  // MULTI-TAB SYNC
+  // One tab (the leader) talks to the API; every tab renders from shared
+  // storage. Leadership uses the Web Locks API when available, otherwise a
+  // storage heartbeat. BroadcastChannel pushes "state changed" pings.
+  // ===========================================================================
+  const Sync = (() => {
+    const tabId = U.uid();
+    let leader = false;
+    let mode = 'none';
+    let heartbeatTimer = null;
+    let bc = null;
+    const leaderSubs = [];
+    const msgSubs = [];
+    let lastRev = null;
+
+    try { if (typeof BroadcastChannel === 'function') bc = new BroadcastChannel('trt-sync-v1'); } catch (e) { bc = null; }
+    if (bc) bc.onmessage = (ev) => { const m = ev && ev.data; if (m && m.from !== tabId) msgSubs.forEach((f) => f(m)); };
+
+    function setLeader(v) {
+      if (leader === v) return;
+      leader = v;
+      leaderSubs.forEach((f) => { try { f(v); } catch (e) { /* ignore */ } });
+    }
+    function requestLock(steal) {
+      try {
+        const opts = steal ? { mode: 'exclusive', steal: true } : { mode: 'exclusive' };
+        navigator.locks.request('trt-leader-v1', opts, () => {
+          setLeader(true);
+          return new Promise(() => { /* held until the tab closes */ });
+        }).catch(() => {
+          // Lock was stolen by another tab or the request failed.
+          setLeader(false);
+          if (mode === 'locks') setTimeout(() => requestLock(false), 2000);
+        });
+      } catch (e) { startHeartbeat(); }
+    }
+    function startHeartbeat() {
+      mode = 'heartbeat';
+      const beat = () => {
+        const now = Date.now();
+        const L = Store.get('leader', null);
+        if (!L || L.id === tabId || now - L.ts > 30000) {
+          Store.set('leader', { id: tabId, ts: now });
+          // write-then-verify to reduce double leadership
+          setTimeout(() => { const C = Store.get('leader', null); setLeader(!!C && C.id === tabId); }, 250);
+        } else {
+          setLeader(false);
+        }
+      };
+      beat();
+      heartbeatTimer = setInterval(beat, 10000);
+      window.addEventListener('pagehide', () => {
+        const L = Store.get('leader', null);
+        if (L && L.id === tabId) Store.del('leader');
+      });
+    }
+    function start() {
+      if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
+        mode = 'locks';
+        requestLock(false);
+      } else {
+        startHeartbeat();
+      }
+      // Fallback change detection for environments without BroadcastChannel.
+      setInterval(() => {
+        const r = Store.get('rev', null);
+        if (r && r.from !== tabId && (!lastRev || r.at !== lastRev.at)) {
+          lastRev = r;
+          if (!bc) msgSubs.forEach((f) => f(r));
+        }
+      }, 5000);
+    }
+    // A visible tab may take over when the leader stopped updating (e.g. a frozen tab).
+    function takeOver() {
+      if (leader) return;
+      if (mode === 'locks') requestLock(true);
+      else { Store.set('leader', { id: tabId, ts: Date.now() }); setLeader(true); }
+    }
+    function broadcast(type) {
+      const msg = { type, from: tabId, at: Date.now() };
+      lastRev = msg;
+      Store.set('rev', msg);
+      if (bc) { try { bc.postMessage(msg); } catch (e) { /* ignore */ } }
+    }
+    return {
+      tabId, start, takeOver, broadcast,
+      isLeader: () => leader,
+      mode: () => mode,
+      onLeader: (f) => leaderSubs.push(f),
+      onMessage: (f) => msgSubs.push(f),
+      _forceLeader: (v) => setLeader(v),
+    };
+  })();
+  // ===========================================================================
+  // API CLIENT
+  // The only network code in the script. Every request goes to
+  // https://api.torn.com/v2 and passes through one queue that enforces a
+  // per-script budget, in-flight de-duplication, timeouts and backoff.
+  // ===========================================================================
+  const Api = (() => {
+    const MAX_PER_MINUTE = 20;   // Torn allows 100/min per user across all tools; we use a fifth at most
+    const TIMEOUT_MS = 15000;
+    const stamps = [];           // send times inside the last minute
+    const inflight = new Map();
+    let pausedUntil = 0;
+    let pauseReason = '';
+    let halted = null;           // { code, message } when the key must not be used again
+    const stats = { sent: 0, failed: 0, lastError: null, lastOkAt: 0 };
+    const listeners = [];
+
+    // Torn API error codes (https://www.torn.com/api.html)
+    const HALT_CODES = { 1: 'API key is empty.', 2: 'Torn rejected the API key.', 10: 'The key owner is in federal jail.', 13: 'The key is disabled because the owner has been inactive for 7+ days.', 18: 'This API key is paused by its owner.' };
+    const RETRY_CODES = new Set([0, 12, 15, 17]);
+
+    function getKey() {
+      const own = Store.get('apikey', null);
+      if (typeof own === 'string' && /^[A-Za-z0-9]{16}$/.test(own)) return own;
+      if (hasPdaKey()) return PDA_KEY;
+      return null;
+    }
+    function keySource() {
+      const own = Store.get('apikey', null);
+      if (typeof own === 'string' && /^[A-Za-z0-9]{16}$/.test(own)) return 'saved';
+      return hasPdaKey() ? 'tornpda' : null;
+    }
+    function keyFingerprint(k) {
+      // short non-reversible tag so a stored "invalid key" flag only applies to that key
+      let h = 2166136261;
+      for (let i = 0; i < k.length; i++) { h ^= k.charCodeAt(i); h = Math.imul(h, 16777619); }
+      return (h >>> 0).toString(36);
+    }
+    function emit() { listeners.forEach((f) => { try { f(); } catch (e) { /* ignore */ } }); }
+    function qs(params) {
+      return Object.keys(params)
+        .filter((k) => params[k] !== undefined && params[k] !== null && params[k] !== '')
+        .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(Array.isArray(params[k]) ? params[k].join(',') : String(params[k])))
+        .join('&');
+    }
+    function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+    async function waitForSlot() {
+      for (;;) {
+        const now = Date.now();
+        if (pausedUntil > now) { await sleep(Math.min(pausedUntil - now, 5000)); continue; }
+        while (stamps.length && now - stamps[0] > 60000) stamps.shift();
+        if (stamps.length < MAX_PER_MINUTE) { stamps.push(now); return; }
+        await sleep(Math.max(250, 60000 - (now - stamps[0]) + 50));
+      }
+    }
+    function restoreHalt() {
+      const k = getKey();
+      const flag = Store.get('keyflag', null);
+      if (k && flag && flag.fp === keyFingerprint(k)) halted = { code: flag.code, message: flag.message };
+      else halted = null;
+    }
+    function clearHalt() { halted = null; Store.del('keyflag'); emit(); }
+    function pause(ms, reason) { pausedUntil = Math.max(pausedUntil, Date.now() + ms); pauseReason = reason; emit(); }
+
+    async function doFetch(url) {
+      const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = setTimeout(() => { if (ctrl) ctrl.abort(); }, TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { method: 'GET', credentials: 'omit', cache: 'no-store', signal: ctrl ? ctrl.signal : undefined, headers: { Accept: 'application/json' } });
+        const text = await res.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch (e) { return { netError: 'Torn returned an unreadable response (HTTP ' + res.status + ').' }; }
+        return { json };
+      } catch (e) {
+        return { netError: (e && e.name === 'AbortError') ? 'Request timed out.' : 'Network error.' };
+      } finally { clearTimeout(timer); }
+    }
+
+    // path: '/user', '/user/log', ...; params: query params (no key). Returns
+    // { ok:true, data, sentAt, recvAt } or { ok:false, error:{ code, message } }
+    function request(path, params, opts) {
+      const o = opts || {};
+      const dedupKey = path + '?' + qs(params || {});
+      if (inflight.has(dedupKey)) return inflight.get(dedupKey);
+      const p = (async () => {
+        let attempt = 0;
+        for (;;) {
+          if (halted) return { ok: false, error: { code: 'halted', message: halted.message } };
+          const key = getKey();
+          if (!key) return { ok: false, error: { code: 'nokey', message: 'API key required.' } };
+          await waitForSlot();
+          const url = API_BASE + path + '?' + qs(Object.assign({}, params || {}, { comment: API_COMMENT, key }));
+          const sentAt = Date.now();
+          stats.sent++;
+          const r = await doFetch(url);
+          const recvAt = Date.now();
+          if (r.netError) {
+            stats.failed++; stats.lastError = { code: 'net', message: r.netError, at: recvAt };
+            if (attempt < (o.retries == null ? 2 : o.retries)) { attempt++; await sleep(attempt === 1 ? 3000 : 10000); continue; }
+            emit();
+            return { ok: false, error: { code: 'net', message: r.netError } };
+          }
+          const j = r.json;
+          if (j && j.error) {
+            const code = Number(j.error.code);
+            const message = U.redact(j.error.error || ('Torn API error ' + code));
+            stats.failed++; stats.lastError = { code, message, at: recvAt };
+            if (HALT_CODES[code]) {
+              halted = { code, message: HALT_CODES[code] };
+              Store.set('keyflag', { fp: keyFingerprint(key), code, message: HALT_CODES[code], at: recvAt });
+              emit();
+              return { ok: false, error: { code, message: HALT_CODES[code] } };
+            }
+            if (code === 5) pause(60000, 'Torn rate limit reached. Waiting before the next refresh.');
+            else if (code === 8) pause(10 * 60000, 'Torn temporarily blocked this IP. Waiting 10 minutes.');
+            else if (code === 9 || code === 24) pause(5 * 60000, 'The Torn API is temporarily unavailable.');
+            if (RETRY_CODES.has(code) && attempt < (o.retries == null ? 2 : o.retries)) { attempt++; await sleep(attempt === 1 ? 3000 : 10000); continue; }
+            emit();
+            return { ok: false, error: { code, message } };
+          }
+          stats.lastOkAt = recvAt; stats.lastError = null;
+          emit();
+          return { ok: true, data: j, sentAt, recvAt };
+        }
+      })();
+      inflight.set(dedupKey, p);
+      p.then(() => inflight.delete(dedupKey), () => inflight.delete(dedupKey));
+      return p;
+    }
+    function fp() { const k = getKey(); return k ? keyFingerprint(k) : null; }
+    return {
+      request, getKey, keySource, restoreHalt, clearHalt, pause, fp,
+      isHalted: () => halted,
+      pausedInfo: () => (pausedUntil > Date.now() ? { until: pausedUntil, reason: pauseReason } : null),
+      stats: () => Object.assign({}, stats, { lastMinute: stamps.filter((t) => Date.now() - t < 60000).length }),
+      onChange: (f) => listeners.push(f),
+      _reset: () => { stamps.length = 0; inflight.clear(); pausedUntil = 0; halted = null; },
+    };
+  })();
+  // ===========================================================================
+  // DAILY STATE + EVENT LEDGER
+  // A day state is keyed by its TCT date (YYYY-MM-DD). It holds only raw,
+  // idempotent observations:
+  //   logs.ev      log events keyed by Torn's own log id (dedup across tabs)
+  //   counters     samples of Torn personal-stat counters [observedAt, value, statUpdatedAt]
+  //   casino.s     samples of the casino token balance [observedAt, tokens, tokenRefills]
+  // Daily numbers are always recomputed from these observations, so seeing the
+  // same event twice (two tabs, overlapping fetches) can never count it twice.
+  // ===========================================================================
+  const Ledger = (() => {
+    const MAX_EVENTS = 6000;
+    const MAX_SAMPLES = 400;
+    const CONF = { V: 'VERIFIED', I: 'INFERRED', E: 'ESTIMATED', U: 'UNKNOWN', S: 'STALE' };
+
+    function newDay(dateKey, carryFrom) {
+      const start = Date.parse(dateKey + 'T00:00:00Z');
+      const d = {
+        v: 1, date: dateKey, start,
+        logs: { ev: {}, watermark: null, resumeTo: null, pendingTop: null, complete: false, lastFetch: 0, partialSecond: false },
+        counters: {},
+        casino: { s: [] },
+        createdAt: Date.now(),
+      };
+      // Carry the last pre-midnight observations. They are lower bounds for
+      // the new day's baselines and let the New Day casino grant be recognised.
+      if (carryFrom && carryFrom.date < dateKey) {
+        for (const st of Object.keys(carryFrom.counters || {})) {
+          const s = carryFrom.counters[st].s || [];
+          const last = s.filter((x) => x[0] < start).pop();
+          if (last) d.counters[st] = { s: [last.slice()], hist: null, histTried: 0 };
+        }
+        const cs = (carryFrom.casino && carryFrom.casino.s) || [];
+        const lastC = cs.filter((x) => x[0] < start).pop();
+        if (lastC) d.casino.s.push(lastC.slice());
+      }
+      return d;
+    }
+
+    function classifyEnergy(cat, title) {
+      const t = (cat || '') + ' ' + (title || '');
+      if (/\bgym\b/i.test(t)) return 'Gym';
+      if (/attack/i.test(t)) return 'Attacks';
+      if (/reviv/i.test(t)) return 'Revives';
+      if (/hunt/i.test(t)) return 'Hunting';
+      return 'Other';
+    }
+    function classifyNerve(cat) { return /crime/i.test(cat || '') ? 'Crimes' : 'Other'; }
+
+    // Turns one Torn log entry into a compact ledger event, or null.
+    // Only fields Torn actually provides are used; nothing is guessed.
+    function toEvent(L) {
+      if (!L || L.id == null || !U.isNum(L.timestamp)) return null;
+      const det = L.details || {};
+      const title = String(det.title || L.title || '');
+      const cat = String(det.category || L.category || '');
+      const data = (L.data && typeof L.data === 'object') ? L.data : {};
+      const ts = L.timestamp * 1000;
+      if (U.isNum(data.energy_used) && data.energy_used > 0) return [ts, 'E', data.energy_used, classifyEnergy(cat, title)];
+      if (U.isNum(data.nerve_used) && data.nerve_used > 0) return [ts, 'N', data.nerve_used, classifyNerve(cat)];
+      if (/^crimes?$/i.test(cat.trim())) {
+        if (U.isNum(data.nerve) && data.nerve > 0) return [ts, 'N', data.nerve, 'Crimes'];
+        if (/^crime\b/i.test(title)) return [ts, 'n', null, 'Crimes']; // crime action without nerve data
+        return null;
+      }
+      if (/^gym train/i.test(title)) return [ts, 'e', null, 'Gym']; // gym train without energy data
+      if (/\bxanax\b/i.test(title) && /\b(use|used|take|taken|took|consume|consumed)\b/i.test(title)) return [ts, 'X', 1, 'Xanax'];
+      if (/item shop buy/i.test(title)) return [ts, 'C', U.isNum(data.quantity) ? data.quantity : null, 'City'];
+      return null;
+    }
+
+    // Adds a batch of log entries. Events are routed to the day of their own
+    // TCT timestamp, so late-arriving events for yesterday correct yesterday.
+    function ingestLogs(day, prev, list) {
+      let added = 0; let late = 0;
+      for (const L of list) {
+        const ev = toEvent(L);
+        if (!ev) continue;
+        const id = String(L.id);
+        const key = Time.dateKey(ev[0]);
+        if (key === day.date) {
+          if (!day.logs.ev[id]) { day.logs.ev[id] = ev; added++; }
+        } else if (prev && key === prev.date) {
+          if (!prev.logs.ev[id]) { prev.logs.ev[id] = ev; late++; }
+        }
+      }
+      const ids = Object.keys(day.logs.ev);
+      if (ids.length > MAX_EVENTS) {
+        ids.sort((a, b) => day.logs.ev[a][0] - day.logs.ev[b][0]);
+        ids.slice(0, ids.length - MAX_EVENTS).forEach((id) => { delete day.logs.ev[id]; });
+        day.logs.truncated = true;
+      }
+      return { added, late };
+    }
+
+    function pushSample(arr, sample, sameAs) {
+      const last = arr[arr.length - 1];
+      if (last && last[0] > sample[0]) { // out of order (another tab): insert sorted
+        arr.push(sample); arr.sort((a, b) => a[0] - b[0]);
+      } else if (last && sameAs(last, sample) && arr.length >= 2 && sameAs(arr[arr.length - 2], last)) {
+        arr[arr.length - 1] = sample; // collapse runs of identical values, keep first + latest
+      } else {
+        arr.push(sample);
+      }
+      while (arr.length > MAX_SAMPLES) arr.splice(1, 1);
+    }
+    function addCounterSample(day, stat, obsTs, value, statTs) {
+      if (!U.isNum(value)) return;
+      const c = day.counters[stat] || (day.counters[stat] = { s: [], hist: null, histTried: 0 });
+      pushSample(c.s, [obsTs, value, U.isNum(statTs) ? statTs : null], (a, b) => a[1] === b[1] && a[2] === b[2]);
+    }
+    function setHistBaseline(day, stat, value, statTs) {
+      const c = day.counters[stat] || (day.counters[stat] = { s: [], hist: null, histTried: 0 });
+      c.hist = { value, statTs, at: Date.now() };
+    }
+    function addCasinoSample(day, obsTs, tokens, tokenRefills) {
+      if (!U.isNum(tokens)) return;
+      pushSample(day.casino.s, [obsTs, tokens, U.isNum(tokenRefills) ? tokenRefills : null], (a, b) => a[1] === b[1] && a[2] === b[2]);
+    }
+
+    // ---------------------------------------------------------------- metrics
+    // Daily usage of a monotonic Torn counter (e.g. xantaken). The baseline
+    // (value at 00:00 TCT) is resolved from evidence, best first:
+    //  1. a sample observed today whose stat was last updated before New Day -> exact
+    //  2. lower bound (pre-midnight sample or Torn historical stat) == upper bound -> exact
+    //  3. Torn historical stat as baseline -> inferred
+    //  4. otherwise a range or a lower bound -> estimated
+    function counterMetric(day, stat, flags) {
+      const c = day && day.counters[stat];
+      if (!c || !c.s.length) return { state: 'nodata' };
+      const start = day.start;
+      const s = c.s;
+      const latest = s[s.length - 1];
+      if (latest[0] < start) return { state: 'nodata' };
+      const cur = latest[1];
+      const tsReliable = !(flags && flags[stat] === 'unreliable');
+      if (tsReliable && latest[2] !== null && latest[2] < start) {
+        return { state: 'ok', value: 0, min: 0, max: 0, conf: CONF.V, why: 'No change since New Day (Torn stat timestamp).' };
+      }
+      let exact = null; let lo = -Infinity; let loSrc = null; let hi = cur;
+      for (const x of s) {
+        if (x[0] >= start) {
+          if (tsReliable && x[2] !== null && x[2] < start) exact = x[1];
+          else hi = Math.min(hi, x[1]);
+        } else if (x[1] > lo) { lo = x[1]; loSrc = 'local'; }
+      }
+      if (exact !== null) return { state: 'ok', value: cur - exact, min: cur - exact, max: cur - exact, conf: CONF.V, why: 'Baseline observed after New Day.' };
+      const h = c.hist;
+      if (h && U.isNum(h.value) && h.statTs !== null && h.statTs < start && h.value <= hi && h.value >= lo) { lo = h.value; loSrc = 'hist'; }
+      if (lo > hi) { lo = -Infinity; loSrc = null; } // inconsistent evidence, keep only what is certain
+      if (lo === hi) return { state: 'ok', value: cur - hi, min: cur - hi, max: cur - hi, conf: CONF.V, why: 'Baseline bracketed by observations.' };
+      if (loSrc === 'hist') return { state: 'ok', value: cur - lo, min: cur - hi, max: cur - lo, conf: CONF.I, why: 'Baseline from Torn historical personal stats.' };
+      if (loSrc === 'local') return { state: 'ok', value: null, min: cur - hi, max: cur - lo, conf: CONF.E, why: 'Some usage happened while the tracker was not running.' };
+      return { state: 'ok', value: null, min: cur - hi, max: null, conf: CONF.E, why: 'Usage before the first observation today is unknown.' };
+    }
+
+    // Flags counters whose "last updated" timestamp failed to move although the value did.
+    function auditCounterTimestamps(day, flags) {
+      for (const st of Object.keys(day.counters)) {
+        const s = day.counters[st].s;
+        for (let i = 1; i < s.length; i++) {
+          const a = s[i - 1]; const b = s[i];
+          if (b[1] > a[1] && b[2] !== null && b[2] < a[0] - 60000) flags[st] = 'unreliable';
+        }
+      }
+      return flags;
+    }
+
+    function logMetric(day, kind) {
+      const L = day.logs;
+      let total = 0; let unknown = 0; const cats = {};
+      const unk = kind === 'E' ? 'e' : 'n';
+      for (const id in L.ev) {
+        const e = L.ev[id];
+        if (e[1] === kind) { total += e[2]; cats[e[3]] = (cats[e[3]] || 0) + e[2]; } else if (e[1] === unk) unknown++;
+      }
+      const complete = !!L.complete && !L.partialSecond && !L.truncated;
+      const conf = (complete && !unknown) ? CONF.V : CONF.E;
+      return { state: L.lastFetch ? 'ok' : 'loading', total, cats, unknown, complete, conf };
+    }
+    function logCount(day, kind) {
+      let n = 0; let unknownQty = false;
+      for (const id in day.logs.ev) {
+        const e = day.logs.ev[id];
+        if (e[1] === kind) { if (e[2] === null) unknownQty = true; else n += e[2]; }
+      }
+      return { n, unknownQty };
+    }
+    // Counter result refined by log evidence. Logs only override when they
+    // fall inside the bounds proven by the counter, so a log-title mismatch
+    // can never produce a false number.
+    function refined(day, stat, kind, flags, logsUsable) {
+      const m = counterMetric(day, stat, flags);
+      if (!logsUsable || !day.logs.complete) return m;
+      const lc = logCount(day, kind);
+      if (lc.unknownQty) return m;
+      if (m.state === 'ok') {
+        const max = m.max === null ? Infinity : m.max;
+        if (lc.n >= m.min && lc.n <= max) return { state: 'ok', value: lc.n, min: lc.n, max: lc.n, conf: CONF.V, why: 'Confirmed by your activity log.' };
+        if (m.conf === CONF.V) return m;
+        return Object.assign({}, m, { why: (m.why || '') + ' Log evidence did not match, so it was not used.' });
+      }
+      return m;
+    }
+
+    function casinoMetric(day, coreSec) {
+      const start = day.start;
+      const all = day.casino.s;
+      const today = all.filter((x) => x[0] >= start);
+      if (!today.length) return { state: 'nodata' };
+      const pre = all.filter((x) => x[0] < start).pop() || null;
+      const maxGap = Math.max(3 * coreSec * 1000, 5 * 60000);
+      const seq = pre ? [pre].concat(today) : today;
+      let spent = 0; let gained = 0; let grant = null; let gaps = false; let ambiguous = false;
+      for (let i = 1; i < seq.length; i++) {
+        const a = seq[i - 1]; const b = seq[i]; const d = b[1] - a[1];
+        if (b[0] - a[0] > maxGap) gaps = true;
+        if (a[2] !== null && b[2] !== null && b[2] > a[2]) ambiguous = true; // a token refill happened in between
+        if (a[0] < start) { // interval that crosses New Day
+          if (d > 0) grant = d; else if (d < 0) ambiguous = true;
+          continue;
+        }
+        if (d < 0) spent += -d; else if (d > 0) gained += d;
+      }
+      const coveredFromNewDay = !!pre && (today[0][0] - pre[0] <= maxGap);
+      const conf = (coveredFromNewDay && !gaps && !ambiguous) ? CONF.I : CONF.E;
+      return { state: 'ok', spent, gained, grant, balance: today[today.length - 1][1], conf, lowerBound: conf !== CONF.I, coveredFromNewDay, gaps, ambiguous };
+    }
+
+    return {
+      CONF, newDay, toEvent, ingestLogs, addCounterSample, setHistBaseline, addCasinoSample,
+      counterMetric, auditCounterTimestamps, logMetric, logCount, refined, casinoMetric, classifyEnergy,
+    };
+  })();
+  // ===========================================================================
+  // DATA CONTAINER  (shared state persisted in userscript storage)
+  // ===========================================================================
+  const Data = (() => {
+    let snap = Store.get('snap', null) || {};
+    let day = Store.get('day', null);
+    let prev = Store.get('prev', null);
+    let meta = Store.get('meta', null) || {};
+    let hist = Store.get('hist', null) || [];
+    let ephemeral = false; // follower tab showing a new day before the leader wrote it
+    const MAX_HIST = 90;
+
+    function validDay(d) { return d && typeof d.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d.date) && d.logs && d.counters && d.casino; }
+    if (!validDay(day)) day = null;
+    if (!validDay(prev)) prev = null;
+    if (!Array.isArray(hist)) hist = [];
+
+    function reload() {
+      snap = Store.get('snap', null) || {};
+      const d = Store.get('day', null);
+      if (validDay(d) && (!day || d.date >= day.date)) { day = d; ephemeral = false; }
+      const p = Store.get('prev', null); prev = validDay(p) ? p : prev;
+      meta = Store.get('meta', null) || meta;
+      const h = Store.get('hist', null); hist = Array.isArray(h) ? h : hist;
+    }
+    function saveSnap() { Store.set('snap', snap); }
+    function saveDay() { if (!ephemeral) { Store.set('day', day); if (prev) Store.set('prev', prev); } }
+    function saveMeta() { Store.set('meta', meta); }
+    function saveHist() { Store.set('hist', hist); }
+
+    function summarize(d) {
+      if (!d) return null;
+      const flags = meta.flags || {};
+      const logsOk = !!(meta.access && meta.access.log);
+      const e = logsOk ? Ledger.logMetric(d, 'E') : null;
+      const n = logsOk ? Ledger.logMetric(d, 'N') : null;
+      const pick = (m) => (m && m.state === 'ok' ? { value: m.value, min: m.min, max: m.max, conf: m.conf } : null);
+      const cas = Ledger.casinoMetric(d, Settings.get().refresh.coreSec);
+      return {
+        date: d.date,
+        energy: e && e.state === 'ok' ? { total: e.total, cats: e.cats, conf: e.conf } : null,
+        nerve: n && n.state === 'ok' ? { total: n.total, cats: n.cats, conf: n.conf } : null,
+        xanax: pick(Ledger.refined(d, 'xantaken', 'X', flags, logsOk)),
+        city: pick(Ledger.refined(d, 'cityitemsbought', 'C', flags, logsOk)),
+        casino: cas.state === 'ok' ? { spent: cas.spent, gained: cas.gained, conf: cas.conf } : null,
+        refills: {
+          energy: pick(Ledger.counterMetric(d, 'refills', flags)),
+          nerve: pick(Ledger.counterMetric(d, 'nerverefills', flags)),
+          token: pick(Ledger.counterMetric(d, 'tokenrefills', flags)),
+        },
+        archivedAt: Date.now(),
+      };
+    }
+    function putHist(entry) {
+      if (!entry) return;
+      const i = hist.findIndex((h) => h.date === entry.date);
+      if (i >= 0) hist[i] = entry; else hist.push(entry);
+      hist.sort((a, b) => (a.date < b.date ? -1 : 1));
+      while (hist.length > MAX_HIST) hist.shift();
+    }
+
+    // Switches the ledger to the given TCT date. Game-state values are NOT
+    // assumed: they stay marked stale until fresh Torn data arrives.
+    function ensureDay(dateKey, canWrite) {
+      if (day && day.date === dateKey && (!ephemeral || !canWrite)) return false;
+      // A follower may have shown an ephemeral new day; the leader rolls over from the persisted day.
+      const stored = Store.get('day', null);
+      const old = ephemeral ? (validDay(stored) ? stored : null) : day;
+      if (old && old.date === dateKey) { day = old; ephemeral = false; return true; }
+      if (old && old.date > dateKey) { if (!day) { day = old; ephemeral = false; } return false; } // never go backwards
+      const next = Ledger.newDay(dateKey, old);
+      if (!canWrite) { day = next; ephemeral = true; return true; }
+      if (old) {
+        putHist(summarize(old));
+        prev = (old.date === Time.prevDateKey(dateKey)) ? old : null;
+      }
+      day = next; ephemeral = false;
+      meta.rolloverAt = Date.now();
+      saveDay(); saveHist(); saveMeta();
+      if (!prev) Store.del('prev');
+      return true;
+    }
+    function archivePrevAgain() { if (prev) { putHist(summarize(prev)); saveHist(); } }
+
+    return {
+      reload, saveSnap, saveDay, saveMeta, saveHist, ensureDay, summarize, putHist, archivePrevAgain,
+      get snap() { return snap; }, set snap(v) { snap = v; },
+      get day() { return day; },
+      get prev() { return prev; },
+      get meta() { return meta; },
+      get hist() { return hist; },
+      get ephemeral() { return ephemeral; },
+      resetHistory() { hist = []; day = null; prev = null; ephemeral = false; Store.del('hist'); Store.del('day'); Store.del('prev'); },
+      replaceHist(h) { hist = h; saveHist(); },
+      _set(d) { day = d.day !== undefined ? d.day : day; prev = d.prev !== undefined ? d.prev : prev; if (d.meta) meta = d.meta; if (d.snap) snap = d.snap; },
+    };
+  })();
+
+  // ===========================================================================
+  // API RESPONSE PARSERS  (field names verified against Torn's OpenAPI spec v6.13.4)
+  // ===========================================================================
+  const Parse = {
+    access(info) {
+      // /v2/key/info -> { info: { selections:{user:[...]}, user:{id}, access:{ level, type, log:{ custom_permissions, available:[...] } } } }
+      const i = info && info.info;
+      if (!i || !i.access) return null;
+      const userSel = (i.selections && Array.isArray(i.selections.user)) ? i.selections.user.map(String) : [];
+      return {
+        type: String(i.access.type || ''),
+        level: U.isNum(i.access.level) ? i.access.level : null,
+        userId: i.user && U.isNum(i.user.id) ? i.user.id : null,
+        sel: userSel,
+        log: userSel.includes('log'),
+        logCustom: !!(i.access.log && i.access.log.custom_permissions),
+        logCats: (i.access.log && Array.isArray(i.access.log.available)) ? i.access.log.available.map((a) => a && a.category_id).filter(U.isNum) : [],
+      };
+    },
+    refills(r) {
+      if (!r || typeof r !== 'object') return null;
+      // API v1 / legacy format has explicit "_used" names.
+      if ('energy_refill_used' in r || 'nerve_refill_used' in r || 'token_refill_used' in r) {
+        return { format: 'legacy', energy: !!r.energy_refill_used, nerve: !!r.nerve_refill_used, token: !!r.token_refill_used, special: U.isNum(r.special_refills_available) ? r.special_refills_available : null };
+      }
+      if ('energy' in r || 'nerve' in r || 'token' in r) {
+        return { format: 'v2', energy: !!r.energy, nerve: !!r.nerve, token: !!r.token, special: U.isNum(r.special_count) ? r.special_count : null };
+      }
+      return null;
+    },
+    personalStats(ps) {
+      // Historic/stat format: [{ name, value, timestamp }]
+      const out = {};
+      if (Array.isArray(ps)) {
+        for (const x of ps) {
+          if (x && typeof x.name === 'string' && U.isNum(x.value)) out[x.name] = { value: x.value, ts: U.isNum(x.timestamp) ? x.timestamp * 1000 : null };
+        }
+        return out;
+      }
+      // Category format fallback (no per-stat timestamps)
+      if (ps && typeof ps === 'object') {
+        const g = (path) => path.reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), ps);
+        const map = {
+          xantaken: ['drugs', 'xanax'],
+          cityitemsbought: ['trading', 'items', 'bought', 'shops'],
+          refills: ['other', 'refills', 'energy'],
+          nerverefills: ['other', 'refills', 'nerve'],
+          tokenrefills: ['other', 'refills', 'token'],
+        };
+        for (const k of Object.keys(map)) { const v = g(map[k]); if (U.isNum(v)) out[k] = { value: v, ts: null }; }
+      }
+      return out;
+    },
+    logList(data) {
+      const l = data && data.log;
+      if (Array.isArray(l)) return l;
+      if (l && typeof l === 'object') return Object.keys(l).map((id) => Object.assign({ id }, l[id])); // v1 shape safety
+      return [];
+    },
+    // Travel page model (only read while the player is viewing the Travel page).
+    travelModel(model, typeValue, destValue) {
+      if (!model || typeof model !== 'object' || !Array.isArray(model.destinations)) return null;
+      const type = typeValue || (model.travelTypes && model.travelTypes.default) || null;
+      const dests = model.destinations.map((d) => {
+        const t = (type && d && d[type]) || null;
+        const diff = t && t.time && U.isNum(t.time.diff) ? t.time.diff : null;
+        return {
+          id: d && d.id, country: String((d && d.country) || ''),
+          flightSec: (diff !== null && diff >= 60 && diff <= 6 * 3600) ? diff : null,
+          tornFlag: (t && typeof t.ocReadyBeforeBack === 'boolean') ? t.ocReadyBeforeBack : null,
+        };
+      });
+      const selected = destValue != null ? dests.find((d) => String(d.id) === String(destValue)) || null : null;
+      return { type, dests, selected, ocText: typeof model.ocWarningText === 'string' ? model.ocWarningText : null };
+    },
+    ocWarningSeconds(text) {
+      if (!text) return null;
+      const re = /(\d+)\s*(day|hour|minute|second)/gi;
+      let m; let total = 0; let found = false;
+      while ((m = re.exec(text)) !== null) {
+        found = true;
+        const n = parseInt(m[1], 10); const u = m[2].toLowerCase();
+        total += u === 'day' ? n * 86400 : u === 'hour' ? n * 3600 : u === 'minute' ? n * 60 : n;
+      }
+      return found ? total : null;
+    },
+  };
+
+  // ===========================================================================
+  // SERVICE  (runs only in the leader tab)
+  // ===========================================================================
+  const Service = (() => {
+    const busy = {};
+    let loopTimer = null;
+    const forceTimes = [];
+    const listeners = [];
+    function changed(kind) {
+      Sync.broadcast(kind || 'data');
+      listeners.forEach((f) => { try { f(kind); } catch (e) { /* ignore */ } });
+    }
+    function access() { return Data.meta.access || null; }
+    function allowed(sel) { const a = access(); return !!(a && a.sel.includes(sel)); }
+    function nowSec() { return Math.floor(Time.now() / 1000); }
+
+    async function run(name, fn) {
+      if (busy[name]) return;
+      busy[name] = true;
+      try { await fn(); } catch (e) { U.log('task failed', name, e && e.message); } finally { busy[name] = false; }
+    }
+
+    async function refreshKeyInfo() {
+      const key = Api.getKey();
+      if (!key) return;
+      const r = await Api.request('/key/info', { timestamp: nowSec() });
+      const m = Data.meta;
+      if (!r.ok) { m.keyError = r.error; m.keyInfoAt = Date.now(); m.keyFp = Api.fp(); Data.saveMeta(); changed('meta'); return; }
+      const a = Parse.access(r.data);
+      m.access = a; m.keyError = a ? null : { code: 'parse', message: 'Unexpected key info response.' };
+      m.keyInfoAt = Date.now(); m.keySource = Api.keySource(); m.keyFp = Api.fp();
+      m.logAccessDenied = false;
+      Data.saveMeta(); changed('meta');
+      if (a) setTimeout(tick, 50); // load data right away instead of waiting for the next loop
+    }
+
+    function coreSelections() {
+      const base = ['bars', 'cooldowns', 'refills', 'travel', 'organizedcrime', 'timestamp'];
+      const list = base.filter((s) => allowed(s));
+      if (allowed('casino')) list.push('casino');
+      return list;
+    }
+
+    async function refreshCore() {
+      const sels = coreSelections();
+      if (!sels.length) return;
+      const params = { selections: sels, timestamp: nowSec() };
+      if (sels.includes('refills')) params.legacy = 'refills';
+      let r = await Api.request('/user', params);
+      if (!r.ok && params.legacy && (r.error.code === 4 || r.error.code === 22 || r.error.code === 23)) {
+        delete params.legacy; r = await Api.request('/user', params);
+      }
+      const snap = Object.assign({}, Data.snap);
+      if (!r.ok) {
+        snap.coreError = Object.assign({ at: Date.now() }, r.error);
+        if (r.error.code === 16) Data.meta.keyInfoAt = 0; // permissions changed: re-read key info
+        Data.snap = snap; Data.saveSnap(); Data.saveMeta(); changed('snap');
+        return;
+      }
+      const d = r.data;
+      const wasTrusted = Time.trusted();
+      if (U.isNum(d.timestamp)) {
+        Time.syncFromServer(d.timestamp, r.sentAt, r.recvAt);
+        Data.meta.time = Time.persistable();
+      } else Time.acceptLocal();
+      if (Sync.isLeader()) Data.ensureDay(Time.currentDateKey(), true);
+      if (!wasTrusted) setTimeout(tick, 50); // counters and logs need the synced day
+      const serverMs = U.isNum(d.timestamp) ? d.timestamp * 1000 : Time.now();
+      snap.coreAt = Time.now();
+      snap.serverMs = serverMs;
+      snap.coreError = null;
+      if (d.bars) snap.bars = d.bars;
+      if (d.cooldowns) snap.cooldowns = { drug: d.cooldowns.drug, medical: d.cooldowns.medical, booster: d.cooldowns.booster, at: serverMs };
+      if ('refills' in d) snap.refills = Parse.refills(d.refills);
+      if ('travel' in d) snap.travel = d.travel || null;
+      if ('organizedCrime' in d) snap.oc = { present: true, data: d.organizedCrime || null, at: serverMs };
+      if (d.casino && U.isNum(d.casino.tokens)) {
+        snap.casino = { tokens: d.casino.tokens, streak: d.casino.streak, at: serverMs };
+        const day = Data.day;
+        if (day && !Data.ephemeral && Time.dateKey(serverMs) === day.date) {
+          const tr = day.counters.tokenrefills && day.counters.tokenrefills.s;
+          const lastTr = tr && tr.length ? tr[tr.length - 1][1] : null;
+          Ledger.addCasinoSample(day, serverMs, d.casino.tokens, lastTr);
+          Data.saveDay();
+        }
+      }
+      Data.snap = snap;
+      Data.meta.lastCoreAt = Date.now();
+      Data.saveSnap(); Data.saveMeta();
+      changed('snap');
+    }
+
+    async function refreshCounters() {
+      if (!allowed('personalstats')) return;
+      const r = await Api.request('/user/personalstats', { stat: COUNTER_STATS });
+      if (!r.ok) { Data.meta.countersError = Object.assign({ at: Date.now() }, r.error); Data.saveMeta(); changed('meta'); return; }
+      const stats = Parse.personalStats(r.data.personalstats);
+      const day = Data.day;
+      if (!day || Data.ephemeral) return;
+      // Cached responses can be up to 30s old: treat the observation as 30s earlier (conservative).
+      const obs = Time.now() - 30000;
+      for (const st of COUNTER_STATS) if (stats[st]) Ledger.addCounterSample(day, st, obs, stats[st].value, stats[st].ts);
+      Data.meta.flags = Ledger.auditCounterTimestamps(day, Data.meta.flags || {});
+      Data.meta.countersError = null; Data.meta.lastCountersAt = Date.now();
+      learnRefillSemantics();
+      Data.saveDay(); Data.saveMeta(); changed('day');
+    }
+
+    function needsHistBaseline(day) {
+      const flags = Data.meta.flags || {};
+      for (const st of COUNTER_STATS) {
+        const m = Ledger.counterMetric(day, st, flags);
+        const c = day.counters[st];
+        if (m.state === 'ok' && m.conf !== Ledger.CONF.V && c && !c.hist && (c.histTries || 0) < 3 && Date.now() - (c.histTried || 0) > 10 * 60000) return true;
+      }
+      return false;
+    }
+    async function refreshHistBaseline() {
+      const day = Data.day;
+      if (!day || Data.ephemeral || !allowed('personalstats') || !needsHistBaseline(day)) return;
+      COUNTER_STATS.forEach((st) => { const c = day.counters[st]; if (c) { c.histTried = Date.now(); c.histTries = (c.histTries || 0) + 1; } });
+      const r = await Api.request('/user/personalstats', { stat: COUNTER_STATS, timestamp: Math.floor(day.start / 1000) - 1 });
+      if (!r.ok) { Data.saveDay(); return; }
+      const stats = Parse.personalStats(r.data.personalstats);
+      for (const st of COUNTER_STATS) {
+        const x = stats[st];
+        if (x && x.ts !== null && x.ts < day.start) Ledger.setHistBaseline(day, st, x.value, x.ts);
+      }
+      Data.saveDay(); changed('day');
+    }
+
+    // Pages backwards from `to` down to `from` (Torn returns newest first, max 100).
+    async function pageLogs(from, to, ingest) {
+      const MAX_PAGES = 15;
+      let pages = 0; let nanostamp = null; let partial = false; let late = 0;
+      while (pages < MAX_PAGES) {
+        const params = { from, to, limit: 100 };
+        if (nanostamp) params.nanostamp = nanostamp;
+        const r = await Api.request('/user/log', params);
+        pages++;
+        if (!r.ok) return { error: r.error, to, partial, late };
+        const list = Parse.logList(r.data);
+        late += ingest(list) || 0;
+        if (list.length < 100) return { bottom: true, to, partial, late };
+        const minTs = Math.min.apply(null, list.map((x) => x.timestamp).filter(U.isNum));
+        const md = r.data._metadata || {};
+        if (minTs >= to) {
+          // 100+ logs inside one second: use Torn's nanostamp cursor if offered.
+          if (md.nanostamp && md.nanostamp !== nanostamp) { nanostamp = md.nanostamp; continue; }
+          partial = true; to = minTs - 1; nanostamp = null; continue;
+        }
+        nanostamp = null;
+        to = minTs; // inclusive bound; repeated entries are dropped by log id
+      }
+      return { bottom: false, to, partial, late };
+    }
+    function logError(err, L) {
+      const m = Data.meta;
+      L.error = Object.assign({ at: Date.now() }, err);
+      if (err.code === 16) { m.logAccessDenied = true; m.keyInfoAt = 0; }
+      if (err.code === 14) m.logsDisabledUntil = Time.nextNewDay(Time.now());
+      Data.saveDay(); Data.saveMeta(); changed('day');
+    }
+    async function refreshLogs() {
+      const a = access();
+      const m = Data.meta;
+      if (!a || !a.log || !Settings.get().useLogs || m.logAccessDenied) return;
+      if (m.logsDisabledUntil && Time.now() < m.logsDisabledUntil) return;
+      const day = Data.day;
+      if (!day || Data.ephemeral) return;
+      // 1) Finish yesterday's last minutes once more after New Day, so late or
+      //    delayed log entries still land in yesterday's archive.
+      const P = Data.prev;
+      if (P && !P.logs.final) {
+        const pStart = Math.floor(P.start / 1000); const pEnd = pStart + 86399;
+        const pFrom = P.logs.watermark ? Math.max(pStart - 1, P.logs.watermark - 60) : pStart - 1;
+        const res = await pageLogs(pFrom, P.logs.resumeTo || pEnd, (list) => Ledger.ingestLogs(P, null, list).added);
+        if (res.error) { logError(res.error, P.logs); return; }
+        if (res.bottom) {
+          P.logs.watermark = pEnd; P.logs.resumeTo = null; P.logs.pendingTop = null; P.logs.complete = true; P.logs.error = null;
+          P.logs.partialSecond = !!(P.logs.partialSecond || res.partial);
+          if (Time.now() - day.start > 60000) P.logs.final = true; // re-check once more after the first minute
+        } else P.logs.resumeTo = res.to;
+        P.logs.lastFetch = Date.now();
+        Data.archivePrevAgain();
+      }
+      // 2) Today's logs, incrementally from the last fully fetched point.
+      const L = day.logs;
+      const dayStartSec = Math.floor(day.start / 1000);
+      const top = L.pendingTop || nowSec();
+      const from = L.watermark ? Math.max(dayStartSec - 1, L.watermark - 60) : dayStartSec - 1;
+      const res = await pageLogs(from, L.resumeTo || top, (list) => Ledger.ingestLogs(day, Data.prev, list).late);
+      if (res.error) { logError(res.error, L); return; }
+      L.error = null;
+      if (res.bottom) { L.watermark = top; L.resumeTo = null; L.pendingTop = null; L.complete = true; }
+      else { L.resumeTo = res.to; L.pendingTop = top; L.complete = false; }
+      L.partialSecond = !!res.partial;
+      L.lastFetch = Date.now();
+      m.lastLogsAt = Date.now();
+      if (Data.prev && res.late > 0) Data.archivePrevAgain();
+      Data.saveDay(); Data.saveMeta(); changed('day');
+    }
+
+    // Learns what the v2 refill booleans mean by comparing them with exact counters.
+    function learnRefillSemantics() {
+      const snap = Data.snap; const day = Data.day;
+      if (!snap.refills || snap.refills.format !== 'v2' || !day || !snap.coreAt || snap.coreAt < day.start) return;
+      const flags = Data.meta.flags || {};
+      const pairs = [['energy', 'refills'], ['nerve', 'nerverefills'], ['token', 'tokenrefills']];
+      for (const [k, st] of pairs) {
+        const c = Ledger.counterMetric(day, st, flags);
+        if (c.state === 'ok' && c.conf === Ledger.CONF.V) {
+          const used = c.value > 0;
+          Data.meta.refillMeaning = (snap.refills[k] === used) ? 'used' : 'available';
+          return;
+        }
+      }
+    }
+
+    function intervalMs(base) {
+      const hidden = typeof document !== 'undefined' && document.hidden;
+      const nearNewDay = Time.untilNewDay() < 120000 || (Time.now() - Time.dayStart(Time.now())) < 120000;
+      return (hidden && !nearNewDay) ? Math.min(base * 3, 300000) : base;
+    }
+
+    function tick() {
+      if (!Sync.isLeader() || !Api.getKey() || Api.isHalted()) return;
+      const m = Data.meta; const now = Date.now();
+      const sameKey = m.keyFp === Api.fp();
+      const keyFresh = m.access && m.keyInfoAt && now - m.keyInfoAt < 6 * 3600000 && sameKey;
+      if (!keyFresh) { if (!m.keyInfoAt || now - m.keyInfoAt > 30000 || !sameKey) run('key', refreshKeyInfo); return; }
+      if (!Time.trusted()) { run('core', refreshCore); return; } // first sync Torn's clock
+      let force = false;
+      for (let i = forceTimes.length - 1; i >= 0; i--) if (forceTimes[i] <= now) { force = true; forceTimes.splice(i, 1); }
+      const coreEvery = intervalMs(Settings.get().refresh.coreSec * 1000);
+      if (force || !m.lastCoreAt || now - m.lastCoreAt >= coreEvery) run('core', refreshCore);
+      if (force || !m.lastCountersAt || now - m.lastCountersAt >= intervalMs(120000)) run('counters', refreshCounters);
+      if (force || !m.lastLogsAt || now - m.lastLogsAt >= intervalMs(120000)) run('logs', refreshLogs);
+      run('hist', refreshHistBaseline);
+    }
+    function start() {
+      if (loopTimer) return;
+      loopTimer = setInterval(tick, 5000);
+      setTimeout(tick, 300);
+    }
+    // After New Day: refresh immediately and once more shortly after,
+    // because Torn may finish its own New Day processing a few seconds late.
+    function forceRefresh(delayMs) {
+      forceTimes.push(Date.now() + (delayMs || 0));
+      if (forceTimes.length > 8) forceTimes.shift();
+      if (!delayMs) setTimeout(tick, 50);
+    }
+    function onUpdate(f) { listeners.push(f); }
+    return { start, tick, forceRefresh, onUpdate, refreshCore, refreshCounters, refreshLogs, refreshKeyInfo, refreshHistBaseline, allowed, coreSelections };
+  })();
+  // ===========================================================================
+  // PAGE READERS  (only the page the player is viewing; never navigates)
+  // ===========================================================================
+  const Pages = (() => {
+    let travel = null;
+    let observer = null;
+    let lastHref = '';
+    const subs = [];
+    let debounce = null;
+    function isTravelPage() {
+      const p = location.pathname; const q = location.search || '';
+      return p === '/travelagency.php' || (p === '/page.php' && /(^|[?&])sid=travel(&|$)/.test(q.replace(/^\?/, '?')));
+    }
+    function readTravel() {
+      const root = document.getElementById('travel-root');
+      if (!root) return { available: false, reason: 'The Travel page data is not loaded yet.' };
+      let model = null;
+      try { model = JSON.parse(root.getAttribute('data-model') || 'null'); } catch (e) { model = null; }
+      const q = (sel) => root.querySelector(sel) || document.querySelector(sel);
+      const typeEl = q('input[name="travelType"][aria-checked="true"]') || q('input[name="travelType"]:checked');
+      const destEl = q('input[name="destination"][aria-checked="true"]') || q('input[name="destination"]:checked');
+      const parsed = Parse.travelModel(model, typeEl && typeEl.value, destEl && destEl.value);
+      if (!parsed) return { available: false, reason: 'This version of the Travel page does not expose flight data the tracker can read.' };
+      if (!parsed.selected) {
+        const btn = q('button[aria-label^="Travel to "]');
+        if (btn) {
+          const c = btn.getAttribute('aria-label').slice('Travel to '.length).trim();
+          parsed.selected = parsed.dests.find((d) => d.country === c) || null;
+        }
+      }
+      return Object.assign({ available: true, readAt: Date.now() }, parsed);
+    }
+    let lastSig = '';
+    function signature(t) { return t ? JSON.stringify([t.available, t.reason, t.type, t.selected && t.selected.id, t.ocText, (t.dests || []).map((d) => [d.flightSec, d.tornFlag])]) : 'none'; }
+    function notify() {
+      const sig = signature(travel);
+      if (sig === lastSig) return; // nothing the UI shows has changed
+      lastSig = sig;
+      subs.forEach((f) => { try { f(); } catch (e) { /* ignore */ } });
+    }
+    function attach() {
+      detach();
+      const root = document.getElementById('travel-root');
+      travel = readTravel();
+      if (root && typeof MutationObserver === 'function') {
+        observer = new MutationObserver(() => {
+          clearTimeout(debounce);
+          debounce = setTimeout(() => { travel = readTravel(); notify(); }, 200);
+        });
+        observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-checked', 'data-model', 'checked'] });
+      }
+      notify();
+    }
+    function detach() { if (observer) { observer.disconnect(); observer = null; } }
+    // Called from the 1s ticker: cheap URL comparison handles SPA navigation.
+    function check() {
+      if (location.href === lastHref && (travel === null || travel.available || !isTravelPage())) return;
+      const changedHref = location.href !== lastHref;
+      lastHref = location.href;
+      if (isTravelPage()) {
+        if (changedHref || !observer) attach();
+      } else if (travel !== null) {
+        detach(); travel = null; notify();
+      }
+    }
+    return { check, isTravelPage, readTravel, onChange: (f) => subs.push(f), get travel() { return travel; } };
+  })();
+
+  const Theme = (() => {
+    function isDark() {
+      const b = document.body;
+      return !!b && b.classList.contains('dark-mode');
+    }
+    function watch(cb) {
+      if (!document.body || typeof MutationObserver !== 'function') return;
+      let last = isDark();
+      new MutationObserver(() => { const d = isDark(); if (d !== last) { last = d; cb(d); } })
+        .observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    }
+    return { isDark, watch };
+  })();
+
+  // ===========================================================================
+  // VIEW MODEL  (pure computation of everything the UI shows)
+  // ===========================================================================
+  const Model = (() => {
+    const C = Ledger.CONF;
+    function goalInfo(used, goal) {
+      if (goal === null || goal === undefined) return { off: true };
+      if (!U.isNum(used)) return { off: false, goal, unknown: true };
+      const pct = goal > 0 ? used / goal : 0;
+      return { off: false, goal, pct, complete: used >= goal, remaining: Math.max(0, goal - used), over: Math.max(0, used - goal) };
+    }
+    function counterDisplay(m) {
+      if (!m || m.state !== 'ok') return { text: null, num: null, conf: C.U };
+      if (m.value !== null && m.value !== undefined) return { text: U.int(m.value), num: m.value, conf: m.conf, range: m.min !== m.max ? [m.min, m.max] : null };
+      if (m.max !== null && m.max !== undefined) return { text: U.int(m.min) + '-' + U.int(m.max), num: m.min, conf: m.conf, range: [m.min, m.max] };
+      return { text: '\u2265' + U.int(m.min), num: m.min, conf: m.conf, lowerBound: true };
+    }
+    function keyState() {
+      const meta = Data.meta;
+      if (!Api.getKey()) return { state: 'none' };
+      const h = Api.isHalted();
+      if (h) return { state: 'halted', message: h.message, code: h.code };
+      if (meta.keyFp !== Api.fp() || !meta.access) {
+        if (meta.keyError && meta.keyFp !== Api.fp()) return { state: 'checking' };
+        return meta.keyError ? { state: 'error', message: meta.keyError.message } : { state: 'checking' };
+      }
+      return { state: 'ok', access: meta.access };
+    }
+    function travelVerdict(returnAt, readyAt, bufferMs, now) {
+      if (!U.isNum(readyAt)) return null;
+      if (returnAt > readyAt) return 'CONFLICT';
+      if (readyAt - returnAt < bufferMs) return 'CAUTION';
+      return 'SAFE';
+    }
+
+    function compute() {
+      const S = Settings.get();
+      const now = Time.now();
+      const day = Data.day;
+      const snap = Data.snap || {};
+      const meta = Data.meta || {};
+      const flags = meta.flags || {};
+      const ks = keyState();
+      const access = ks.state === 'ok' ? ks.access : null;
+      const dayStart = day ? day.start : Time.dayStart(now);
+      const coreEvery = S.refresh.coreSec * 1000;
+      const coreAge = snap.coreAt ? now - snap.coreAt : null;
+      const coreStale = coreAge === null || coreAge > Math.max(3 * coreEvery, 180000);
+      const coreToday = !!snap.coreAt && snap.coreAt >= dayStart;
+      const logsUsable = !!(access && access.log && S.useLogs && !meta.logAccessDenied);
+      const vm = { S, now, key: ks, access, dayKey: day ? day.date : Time.dateKey(now), coreAge, coreStale, coreToday, logsUsable };
+
+      // --- Energy / Nerve (activity log)
+      const logSection = (kind, goal, barKey) => {
+        const bar = snap.bars && snap.bars[barKey] ? snap.bars[barKey] : null;
+        const base = { goal: goalInfo(null, goal), bar, barStale: coreStale };
+        if (!access) return Object.assign(base, { state: ks.state === 'none' ? 'nokey' : 'loading' });
+        if (!access.log || meta.logAccessDenied) return Object.assign(base, { state: 'needs', need: 'Full Access' });
+        if (!S.useLogs) return Object.assign(base, { state: 'off' });
+        if (!day || Data.ephemeral) return Object.assign(base, { state: 'loading' });
+        const m = Ledger.logMetric(day, kind);
+        if (m.state !== 'ok') return Object.assign(base, { state: day.logs.error ? 'error' : 'loading', error: day.logs.error });
+        const order = kind === 'E' ? ['Gym', 'Attacks', 'Revives', 'Hunting', 'Other'] : ['Crimes', 'Other'];
+        const cats = order.filter((c) => m.cats[c]).map((c) => ({ name: c, value: m.cats[c] }));
+        return Object.assign(base, {
+          state: 'ok', total: m.total, cats, unknown: m.unknown, complete: m.complete, conf: m.conf,
+          goal: goalInfo(m.total, goal), error: day.logs.error, lastFetch: day.logs.lastFetch,
+        });
+      };
+      vm.energy = logSection('E', S.goals.energy, 'energy');
+      vm.nerve = logSection('N', S.goals.nerve, 'nerve');
+
+      // --- Counters (Xanax, City)
+      const counterSection = (stat, kind, goal) => {
+        if (!access) return { state: ks.state === 'none' ? 'nokey' : 'loading', goal: goalInfo(null, goal) };
+        if (!access.sel.includes('personalstats')) return { state: 'needs', need: 'personalstats', goal: goalInfo(null, goal) };
+        if (!day || Data.ephemeral) return { state: 'loading', goal: goalInfo(null, goal) };
+        const m = Ledger.refined(day, stat, kind, flags, logsUsable);
+        if (m.state !== 'ok') return { state: meta.countersError ? 'error' : 'loading', error: meta.countersError, goal: goalInfo(null, goal) };
+        const d = counterDisplay(m);
+        return { state: 'ok', m, disp: d, goal: goalInfo(d.num, goal) };
+      };
+      vm.xanax = counterSection('xantaken', 'X', S.goals.xanax);
+      vm.city = counterSection('cityitemsbought', 'C', S.goals.city);
+      if (vm.city.state === 'ok' && U.isNum(vm.city.disp.num)) {
+        vm.city.allowanceLeft = Math.max(0, CITY_DAILY_ALLOWANCE - vm.city.disp.num);
+        vm.city.allowanceUsedExact = !vm.city.disp.range && !vm.city.disp.lowerBound;
+      }
+
+      // --- Cooldowns
+      const cd = snap.cooldowns;
+      const cdOne = (k) => {
+        if (!cd || !U.isNum(cd[k])) return { state: access ? 'loading' : 'nokey' };
+        return { state: 'ok', target: (cd.at || snap.serverMs || now) + cd[k] * 1000, stale: coreStale };
+      };
+      vm.cooldowns = { drug: cdOne('drug'), booster: cdOne('booster'), medical: cdOne('medical') };
+
+      // --- Refills (authoritative state from Torn; never assumed at New Day)
+      const pairs = { energy: 'refills', nerve: 'nerverefills', token: 'tokenrefills' };
+      vm.refills = {};
+      for (const k of Object.keys(pairs)) {
+        const r = snap.refills;
+        const cm = day && !Data.ephemeral ? Ledger.counterMetric(day, pairs[k], flags) : { state: 'nodata' };
+        let out = { state: 'unknown' };
+        if (r && coreToday && r.format === 'legacy') out = { state: 'ok', used: !!r[k], conf: C.V };
+        else if (cm.state === 'ok' && cm.conf === C.V) out = { state: 'ok', used: cm.value > 0, conf: C.V };
+        else if (r && coreToday && r.format === 'v2' && meta.refillMeaning) out = { state: 'ok', used: meta.refillMeaning === 'used' ? !!r[k] : !r[k], conf: C.V };
+        else if (r && coreToday && r.format === 'v2') out = { state: 'ok', used: !!r[k], conf: C.I };
+        else if (r && !coreToday) out = { state: 'stale' };
+        if (out.state === 'ok' && coreStale) out.stale = true;
+        vm.refills[k] = out;
+      }
+      vm.refills.special = snap.refills && coreToday ? snap.refills.special : null;
+      if (!access) vm.refills.nokey = true;
+
+      // --- Casino
+      const cas = { goal: goalInfo(null, S.goals.casino), base: CASINO_DAILY_BASE, refill: vm.refills.token };
+      if (!access) cas.state = ks.state === 'none' ? 'nokey' : 'loading';
+      else if (!access.sel.includes('casino')) cas.state = 'needs';
+      else if (!day || Data.ephemeral) cas.state = 'loading';
+      else {
+        const m = Ledger.casinoMetric(day, S.refresh.coreSec);
+        cas.balance = snap.casino && U.isNum(snap.casino.tokens) ? snap.casino.tokens : null;
+        cas.balanceStale = coreStale || !coreToday;
+        if (m.state !== 'ok') cas.state = 'loading';
+        else Object.assign(cas, { state: 'ok', m, goal: goalInfo(m.spent, S.goals.casino) });
+      }
+      vm.casino = cas;
+
+      // --- Organized crime
+      const ocSnap = snap.oc;
+      let oc = { state: access ? 'loading' : 'nokey' };
+      if (access && !access.sel.includes('organizedcrime')) oc = { state: 'needs' };
+      else if (ocSnap && ocSnap.present) {
+        const o = ocSnap.data;
+        if (!o) oc = { state: 'none' };
+        else if (o.code === 27) oc = { state: 'notmigrated' };
+        else if (typeof o.status === 'string') {
+          const slots = Array.isArray(o.slots) ? o.slots : [];
+          oc = {
+            state: 'ok', name: String(o.name || 'Organized crime'), status: o.status,
+            readyAt: U.isNum(o.ready_at) ? o.ready_at * 1000 : null,
+            executedAt: U.isNum(o.executed_at) ? o.executed_at * 1000 : null,
+            filled: slots.filter((s) => s && s.user).length, slots: slots.length,
+            active: o.status === 'Recruiting' || o.status === 'Planning',
+            stale: coreStale,
+          };
+        }
+      }
+      vm.oc = oc;
+
+      // --- Travel / OC conflict
+      const buffer = S.travel.bufferMinutes * 60000;
+      const stay = S.travel.stayMinutes * 60000;
+      const readyAt = oc.state === 'ok' && oc.active ? oc.readyAt : null;
+      const page = Pages.travel;
+      const tr = { state: 'nodata', readyAt, buffer, stay };
+      const t = snap.travel;
+      if (t && typeof t.destination === 'string') {
+        const left = U.isNum(t.time_left) ? t.time_left * 1000 : 0;
+        const dep = U.isNum(t.departed_at) ? t.departed_at * 1000 : null;
+        const arr = U.isNum(t.arrival_at) ? t.arrival_at * 1000 : null;
+        const flight = dep !== null && arr !== null && arr > dep ? arr - dep : null;
+        // Remaining time is measured from the snapshot, then corrected to "now".
+        const snapAge = snap.coreAt ? Math.max(0, now - snap.coreAt) : 0;
+        const leftNow = Math.max(0, left - snapAge);
+        if (t.destination === 'Torn' && leftNow <= 0) Object.assign(tr, { state: 'ok', where: 'torn' });
+        else if (t.destination === 'Torn') Object.assign(tr, { state: 'ok', where: 'returning', returnAt: now + leftNow });
+        else if (flight !== null) {
+          const ret = (leftNow > 0 ? now + leftNow : now) + Math.round(flight * 1.03) + stay;
+          Object.assign(tr, { state: 'ok', where: leftNow > 0 ? 'outbound' : 'abroad', dest: t.destination, returnAt: ret, landsAt: leftNow > 0 ? now + leftNow : null });
+        } else Object.assign(tr, { state: 'ok', where: leftNow > 0 ? 'outbound' : 'abroad', dest: t.destination, returnAt: null });
+        if (tr.where === 'torn') tr.verdict = readyAt ? 'SAFE' : null;
+        else if (U.isNum(tr.returnAt)) tr.verdict = travelVerdict(tr.returnAt, readyAt, buffer, now);
+        tr.stale = coreStale;
+      }
+      if (page && page.available) {
+        const sel = page.selected;
+        const pg = { available: true, type: page.type, dest: sel ? sel.country : null };
+        const ocSec = Parse.ocWarningSeconds(page.ocText);
+        const pageReady = readyAt || (ocSec !== null && page.readAt ? page.readAt + ocSec * 1000 : null);
+        pg.readyAt = pageReady;
+        pg.readySource = readyAt ? 'api' : (pageReady ? 'page' : null);
+        if (sel && sel.flightSec) {
+          pg.flightMs = sel.flightSec * 1000;
+          pg.returnAt = now + Math.round(2 * pg.flightMs * 1.03) + stay;
+          pg.ours = pageReady ? travelVerdict(pg.returnAt, pageReady, buffer, now) : 'SAFE';
+          pg.oursNoOc = !pageReady;
+        }
+        if (sel && sel.tornFlag !== null) pg.torn = sel.tornFlag ? 'CONFLICT' : 'SAFE';
+        pg.flagged = page.dests.filter((d) => d.tornFlag === true).map((d) => d.country);
+        pg.differs = !!(pg.torn && pg.ours && (pg.torn === 'CONFLICT') !== (pg.ours === 'CONFLICT'));
+        tr.page = pg;
+      } else if (page && !page.available) {
+        tr.page = { available: false, reason: page.reason };
+      }
+      vm.travel = tr;
+
+      // --- New day
+      vm.newDay = { at: Time.nextNewDay(now), frac: Time.dayFraction(), source: Time.info().source };
+      vm.status = {
+        lastCoreAt: snap.coreAt || null,
+        coreError: snap.coreError || null,
+        paused: Api.pausedInfo(),
+        leader: Sync.isLeader(),
+        timeSource: Time.info().source,
+        logError: day && day.logs.error ? day.logs.error : null,
+      };
+      return vm;
+    }
+    return { compute, goalInfo, counterDisplay, travelVerdict };
+  })();
+  // ===========================================================================
+  // STYLES  (every selector is scoped under #trt-root; Torn's own CSS is untouched)
+  // ===========================================================================
+  const CSS = `
+#trt-root{position:fixed;z-index:9999;font-size:12px;line-height:1.35;text-align:left;letter-spacing:normal;color:var(--trt-text);
+--trt-bg:#202124;--trt-bg2:#27282c;--trt-line:#3a3c41;--trt-text:#e1e2e4;--trt-muted:#a3a5aa;--trt-faint:#75777d;--trt-track:#35373c;--trt-shadow:rgba(0,0,0,.5);--trt-focus:#8fb4e8;
+--trt-energy:#8bb043;--trt-nerve:#d2705d;--trt-xanax:#a493d3;--trt-city:#58b0b1;--trt-casino:#d2ab55;--trt-oc:#7e9ed2;--trt-good:#8fb547;--trt-warn:#dba646;--trt-bad:#e07462}
+#trt-root.trt-light{--trt-bg:#f7f7f8;--trt-bg2:#ffffff;--trt-line:#d3d5da;--trt-text:#222327;--trt-muted:#5a5d64;--trt-faint:#8a8d94;--trt-track:#e2e4e8;--trt-shadow:rgba(28,30,34,.16);--trt-focus:#2f6fd0;
+--trt-energy:#5b851c;--trt-nerve:#ad4836;--trt-xanax:#6a55aa;--trt-city:#2a7f81;--trt-casino:#8f6c12;--trt-oc:#466ba9;--trt-good:#4f7a12;--trt-warn:#93630a;--trt-bad:#ad3a29}
+#trt-root,#trt-root *{box-sizing:border-box}
+#trt-root[data-state=hidden]{display:none!important}
+#trt-root button{font:inherit;color:inherit;background:none;border:0;margin:0;padding:0;cursor:pointer;line-height:inherit;text-transform:none;min-width:0;width:auto;height:auto;box-shadow:none;border-radius:0;text-shadow:none;float:none}
+#trt-root a{color:inherit}
+#trt-root input,#trt-root select,#trt-root textarea{font:inherit;color:var(--trt-text);background:var(--trt-bg2);border:1px solid var(--trt-line);border-radius:.3em;margin:0;padding:.25em .4em;box-shadow:none;height:auto;max-width:100%;float:none}
+#trt-root input[type=checkbox],#trt-root input[type=radio]{width:auto;padding:0;accent-color:var(--trt-focus)}
+#trt-root :focus-visible{outline:2px solid var(--trt-focus);outline-offset:1px}
+#trt-root .trt-num{font-variant-numeric:tabular-nums}
+#trt-root .trt-tile{position:relative;min-width:7.8em;padding:.5em .55em .4em;background:var(--trt-bg);border:1px solid var(--trt-line);border-radius:.55em;box-shadow:0 .2em .9em var(--trt-shadow);cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:none;overflow:hidden}
+#trt-root .trt-tile:hover{border-color:var(--trt-faint)}
+#trt-root .trt-tile.trt-stale{border-style:dashed}
+#trt-root .trt-day{position:absolute;left:0;top:0;height:2px;background:var(--trt-faint);opacity:.8;pointer-events:none}
+#trt-root .trt-crow{display:flex;align-items:center;gap:.35em;white-space:nowrap;min-height:1.6em}
+#trt-root .trt-ci{flex:none;width:1.35em;text-align:center;font-size:.95em;line-height:1}
+#trt-root .trt-cv{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums}
+#trt-root .trt-cg{font-weight:400;color:var(--trt-muted)}
+#trt-root .trt-cs{flex:none;width:.9em;text-align:right;font-size:.85em;color:var(--trt-muted)}
+#trt-root .trt-cs.trt-ok{color:var(--trt-good)}
+#trt-root .trt-hair{height:2px;margin:0 0 .15em 1.7em;background:var(--trt-track);border-radius:1px;overflow:hidden}
+#trt-root .trt-hair>i,#trt-root .trt-bar>i{display:block;height:100%;background:var(--c,var(--trt-faint))}
+#trt-root .trt-cempty{color:var(--trt-muted);font-size:.95em;max-width:10em;white-space:normal;padding:.15em 0}
+#trt-root .trt-panel{position:relative;width:21.5em;max-width:calc(100vw - 16px);max-height:var(--trt-maxh,80vh);display:flex;flex-direction:column;background:var(--trt-bg);border:1px solid var(--trt-line);border-radius:.6em;box-shadow:0 .5em 1.8em var(--trt-shadow);overflow:hidden}
+#trt-root .trt-head{display:flex;align-items:center;gap:.5em;padding:.55em .4em .5em .75em;background:var(--trt-bg2);border-bottom:1px solid var(--trt-line);cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none;flex:none}
+#trt-root.trt-dragging .trt-head,#trt-root.trt-dragging .trt-tile{cursor:grabbing}
+#trt-root .trt-titles{min-width:0;flex:1}
+#trt-root .trt-title{font-weight:700;font-size:1.1em}
+#trt-root .trt-sub{color:var(--trt-muted);font-size:.9em;display:flex;column-gap:.9em;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+#trt-root .trt-actions{display:flex;flex:none}
+#trt-root .trt-ib{width:1.95em;height:1.95em;border-radius:.35em;display:inline-flex;align-items:center;justify-content:center;color:var(--trt-muted);font-size:1.05em}
+#trt-root .trt-ib:hover{background:var(--trt-track);color:var(--trt-text)}
+#trt-root .trt-ib[disabled]{opacity:.35;cursor:default}
+#trt-root .trt-body{overflow-y:auto;overscroll-behavior:contain;flex:1 1 auto;min-height:0}
+#trt-root .trt-sec{padding:.6em .75em .65em;border-bottom:1px solid var(--trt-line)}
+#trt-root .trt-sec:last-child{border-bottom:0}
+#trt-root .trt-sh{display:flex;align-items:center;gap:.4em;color:var(--trt-muted)}
+#trt-root .trt-sh .trt-ci{color:var(--trt-text)}
+#trt-root .trt-right{margin-left:auto;display:flex;gap:.45em;align-items:center}
+#trt-root .trt-conf{color:var(--trt-muted);font-weight:700}
+#trt-root .trt-big{display:flex;align-items:baseline;gap:.45em;margin:.25em 0 .2em;flex-wrap:wrap}
+#trt-root .trt-bv{font-size:1.65em;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+#trt-root .trt-bu{color:var(--trt-muted)}
+#trt-root .trt-bv .trt-bu{font-size:.6em;font-weight:400}
+#trt-root .trt-goalrow{display:flex;justify-content:space-between;gap:.6em;color:var(--trt-muted);margin-bottom:.25em}
+#trt-root .trt-goalrow b{color:var(--trt-text);font-weight:600}
+#trt-root .trt-bar{height:4px;border-radius:2px;background:var(--trt-track);overflow:hidden;margin:.15em 0 .45em}
+#trt-root .trt-kv{display:grid;grid-template-columns:1fr auto 1em;column-gap:.6em;row-gap:.12em;font-variant-numeric:tabular-nums;margin-top:.2em}
+#trt-root .trt-kv>span:nth-child(3n+1){color:var(--trt-muted)}
+#trt-root .trt-kv>span:nth-child(3n+2){text-align:right;font-weight:600}
+#trt-root .trt-kv>span:nth-child(3n){text-align:center;color:var(--trt-muted)}
+#trt-root .trt-note{color:var(--trt-muted);font-size:.92em;margin-top:.3em}
+#trt-root .trt-note b{color:var(--trt-text)}
+#trt-root .trt-pill{display:inline-flex;align-items:center;gap:.25em;padding:0 .45em;border-radius:1em;border:1px solid currentColor;font-size:.92em;font-weight:700}
+#trt-root .trt-good{color:var(--trt-good)}
+#trt-root .trt-warn{color:var(--trt-warn)}
+#trt-root .trt-bad{color:var(--trt-bad)}
+#trt-root .trt-muted{color:var(--trt-muted)}
+#trt-root .trt-stalebadge{font-size:.78em;font-weight:700;padding:0 .35em;border:1px dashed var(--trt-faint);border-radius:.3em;color:var(--trt-muted)}
+#trt-root .trt-banner{padding:.55em .75em;border-bottom:1px solid var(--trt-line);background:var(--trt-bg2)}
+#trt-root .trt-banner b{display:block;margin-bottom:.15em}
+#trt-root .trt-linkbtn{color:var(--trt-focus);text-decoration:underline;text-underline-offset:2px}
+#trt-root .trt-foot{flex:none;padding:.45em .75em;border-top:1px solid var(--trt-line);color:var(--trt-muted);font-size:.88em;background:var(--trt-bg2)}
+#trt-root .trt-footrow{display:flex;justify-content:space-between;gap:.6em}
+#trt-root .trt-support{flex:none;padding:.5em .75em .6em;border-top:1px solid var(--trt-line);font-size:.92em;color:var(--trt-muted)}
+#trt-root .trt-support a{color:var(--trt-text);font-weight:700;text-decoration:underline;text-underline-offset:2px}
+#trt-root .trt-st{font-weight:700;margin-bottom:.35em;color:var(--trt-text)}
+#trt-root .trt-field{display:flex;align-items:center;justify-content:space-between;gap:.6em;margin:.3em 0}
+#trt-root .trt-field>span:first-child{color:var(--trt-muted)}
+#trt-root .trt-field input[type=number]{width:6.2em;text-align:right}
+#trt-root .trt-field input[type=password]{width:11em}
+#trt-root .trt-inline{display:inline-flex;align-items:center;gap:.5em}
+#trt-root .trt-checks{display:grid;grid-template-columns:1fr 1fr;gap:.25em .8em;margin-top:.2em}
+#trt-root .trt-check{display:flex;align-items:center;gap:.4em;cursor:pointer}
+#trt-root .trt-btn{display:inline-block;padding:.32em .7em;border:1px solid var(--trt-line);border-radius:.35em;background:var(--trt-bg2);font-weight:600;text-decoration:none}
+#trt-root .trt-btn:hover{border-color:var(--trt-faint)}
+#trt-root .trt-btn.trt-danger{color:var(--trt-bad)}
+#trt-root .trt-btnrow{display:flex;flex-wrap:wrap;gap:.4em;margin-top:.45em}
+#trt-root textarea{width:100%;min-height:5em;font-size:.88em;resize:vertical}
+#trt-root .trt-tbl{width:100%;border-collapse:collapse;font-size:.86em;margin-top:.35em;font-variant-numeric:tabular-nums}
+#trt-root .trt-tbl td,#trt-root .trt-tbl th{border:1px solid var(--trt-line);padding:.2em .35em;vertical-align:top;text-align:left;font-weight:400}
+#trt-root .trt-tbl th{color:var(--trt-muted)}
+#trt-root .trt-notice{margin-top:.45em;font-weight:600}
+#trt-root .trt-tile:focus-visible{outline-offset:2px}
+@media (prefers-reduced-motion:no-preference){#trt-root .trt-opening{animation:trt-in .14s ease-out}}
+@keyframes trt-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+`;
+
+  // ===========================================================================
+  // UI
+  // ===========================================================================
+  const UI = (() => {
+    let root = null;
+    let box = null;
+    let boxKind = null;
+    let view = 'main';
+    let queued = false;
+    const reasons = new Set();
+    let drag = null;
+    let suppressClickUntil = 0;
+    let notice = null;
+    let exportText = '';
+    let manualAt = 0;
+    const armed = {};
+    const hasMenu = typeof GM_registerMenuCommand === 'function';
+    const touchOnly = (() => { try { return !!(window.matchMedia && window.matchMedia('(hover: none) and (pointer: coarse)').matches); } catch (e) { return false; } })();
+    const canHide = () => hasMenu || !touchOnly;
+    const PRESETS = {
+      'top-left': { h: 'left', v: 'top', x: 12, y: 96 },
+      'top-right': { h: 'right', v: 'top', x: 12, y: 96 },
+      'bottom-left': { h: 'left', v: 'bottom', x: 12, y: 60 },
+      'bottom-right': { h: 'right', v: 'bottom', x: 12, y: 60 },
+    };
+    const ICON = {
+      energy: '\u26A1', nerve: '\uD83E\uDDE0', xanax: '\uD83D\uDC8A', city: '\uD83C\uDFD9\uFE0F', casino: '\uD83C\uDFB0',
+      oc: '\u2694\uFE0F', travel: '\u2708\uFE0F', drug: '\uD83E\uDDEA', booster: '\uD83E\uDD64', medical: '\uD83E\uDE79',
+      newDay: '\uD83C\uDF19', refills: '\uD83D\uDD04', cd: '\u23F1\uFE0F', key: '\uD83D\uDD11',
+    };
+    const CONF_MARK = {
+      VERIFIED: ['\u2713', 'Verified from Torn data'],
+      INFERRED: ['~', 'Inferred from Torn data that cannot be fully confirmed'],
+      ESTIMATED: ['\u2248', 'Estimated: may be incomplete'],
+      UNKNOWN: ['?', 'Unknown'],
+    };
+
+    // ------------------------------------------------------------ helpers
+    function confMark(conf) {
+      if (!Settings.get().modules.confidence || !conf || !CONF_MARK[conf]) return '';
+      const m = CONF_MARK[conf];
+      return '<span class="trt-conf" title="' + U.esc(m[1]) + '" aria-label="' + U.esc(m[1]) + '">' + m[0] + '</span>';
+    }
+    function fmtCd(ms, fmt, done) {
+      if (!U.isNum(ms)) return '?';
+      if (ms <= 0) return done || 'Ready';
+      return fmt === 'short' ? U.short(ms) : fmt === 'long' ? U.long(ms) : U.hms(ms);
+    }
+    // Countdowns store their target timestamp; the 1s ticker recomputes the
+    // remaining time from Torn-corrected "now". Nothing is ever decremented.
+    function cdSpan(target, fmt, done) {
+      return '<span class="trt-num" data-trt-cd="' + Math.round(target) + '" data-fmt="' + fmt + '" data-done="' + U.esc(done || 'Ready') + '">'
+        + U.esc(fmtCd(target - Time.now(), fmt, done)) + '</span>';
+    }
+    function agoSpan(ts) { return '<span data-trt-ago="' + Math.round(ts) + '">' + U.ago(Time.now() - ts) + '</span>'; }
+    function tctHM(ts) { const d = new Date(ts); return U.pad2(d.getUTCHours()) + ':' + U.pad2(d.getUTCMinutes()); }
+    function dayLabel(key) {
+      const d = new Date(Date.parse(key + 'T00:00:00Z'));
+      const W = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      return W[d.getUTCDay()] + ' ' + d.getUTCDate() + ' ' + M[d.getUTCMonth()];
+    }
+    function pct(p) { return Math.round(U.clamp(U.isNum(p) ? p : 0, 0, 1) * 1000) / 10 + '%'; }
+    function bar(p, color) { return '<div class="trt-bar" style="--c:var(--trt-' + color + ')" role="presentation"><i style="width:' + pct(p) + '"></i></div>'; }
+    function note(html) { return '<div class="trt-note">' + html + '</div>'; }
+    function staleBadge(on) { return on ? ' <span class="trt-stalebadge" title="Not refreshed recently">STALE</span>' : ''; }
+    function kv(label, valueHtml, markHtml) { return '<span>' + label + '</span><span>' + valueHtml + '</span><span>' + (markHtml || '') + '</span>'; }
+    function linkBtn(act, label) { return '<button type="button" class="trt-linkbtn" data-act="' + act + '">' + U.esc(label) + '</button>'; }
+    function ib(act, glyph, label, disabled) {
+      return '<button type="button" class="trt-ib" data-act="' + act + '" title="' + U.esc(label) + '" aria-label="' + U.esc(label) + '"' + (disabled ? ' disabled' : '') + '>' + glyph + '</button>';
+    }
+    function section(id, icon, title, right, body) {
+      return '<div class="trt-sec" data-sec="' + id + '"><div class="trt-sh"><span class="trt-ci" aria-hidden="true">' + icon + '</span><span>'
+        + U.esc(title) + '</span><span class="trt-right">' + (right || '') + '</span></div>' + body + '</div>';
+    }
+    function stateText(sec, key) {
+      switch (sec.state) {
+        case 'nokey': return 'add an API key in settings';
+        case 'needs': return (key === 'energy' || key === 'nerve') ? 'needs a Full Access key (activity log)' : 'not included in your API key';
+        case 'off': return 'activity log reading is turned off';
+        case 'error': return 'could not load, retrying';
+        default: return 'loading';
+      }
+    }
+    function verdictPill(v) {
+      if (v === 'SAFE') return '<span class="trt-pill trt-good">\u2713 Safe</span>';
+      if (v === 'CAUTION') return '<span class="trt-pill trt-warn">\u26A0 Caution</span>';
+      if (v === 'CONFLICT') return '<span class="trt-pill trt-bad">\u2715 Conflict</span>';
+      return '<span class="trt-pill trt-muted">\u2013 No active OC</span>';
+    }
+    function accessLabel(a) {
+      if (!a) return '';
+      const t = a.type || '';
+      if (/full/i.test(t)) return 'Full key';
+      if (/limited/i.test(t)) return 'Limited key';
+      if (/minimal/i.test(t)) return 'Minimal key';
+      if (/custom/i.test(t)) return 'Custom key' + (a.log ? ' with log' : '');
+      if (/public/i.test(t)) return 'Public key';
+      return t;
+    }
+
+    // ------------------------------------------------------------ collapsed
+    function crow(icon, color, valueHtml, status, title, hair) {
+      return '<div class="trt-crow" title="' + U.esc(title || '') + '"><span class="trt-ci" aria-hidden="true">' + icon + '</span>'
+        + '<span class="trt-cv">' + valueHtml + '</span><span class="trt-cs' + (status === '\u2713' ? ' trt-ok' : '') + '" aria-hidden="true">' + (status || '') + '</span></div>'
+        + (U.isNum(hair) ? '<div class="trt-hair" style="--c:var(--trt-' + color + ')"><i style="width:' + pct(hair) + '"></i></div>' : '');
+    }
+    function cPlaceholder(key, sec, label) {
+      if (sec.state === 'needs' && (key === 'energy' || key === 'nerve')) {
+        return crow(ICON[key], key, '<span class="trt-cg">Full key</span>', '', label + ': needs a Full Access key (activity log)', null);
+      }
+      return crow(ICON[key], key, '<span class="trt-cg">' + (sec.state === 'loading' ? '\u2026' : '\u2013') + '</span>', sec.state === 'loading' ? '' : '?', label + ': ' + stateText(sec, key), null);
+    }
+    function cLog(key, sec, unit, label) {
+      const S = Settings.get(); const goal = S.goals[key];
+      if (sec.state !== 'ok') return cPlaceholder(key, sec, label);
+      const v = (sec.conf === Ledger.CONF.V ? '' : '\u2265') + U.int(sec.total);
+      const val = (S.energyFormat === 'goal' && goal) ? v + '<span class="trt-cg">/' + U.int(goal) + '</span>' : v + '<span class="trt-cg"> ' + unit + '</span>';
+      const hair = (S.modules.goalProgress && !sec.goal.off && U.isNum(sec.goal.pct)) ? sec.goal.pct : null;
+      return crow(ICON[key], key, val, sec.goal.complete ? '\u2713' : '', label + ' used today: ' + U.int(sec.total) + ' ' + unit, hair);
+    }
+    function cCounter(key, sec, label) {
+      const S = Settings.get(); const goal = S.goals[key];
+      if (sec.state !== 'ok') return cPlaceholder(key, sec, label);
+      const d = sec.disp; const exact = !d.range && !d.lowerBound;
+      const val = U.esc(d.text) + (goal ? '<span class="trt-cg">/' + U.int(goal) + '</span>' : '');
+      const hair = (S.modules.goalProgress && !sec.goal.off && U.isNum(sec.goal.pct)) ? sec.goal.pct : null;
+      return crow(ICON[key], key, val, sec.goal.complete && exact ? '\u2713' : '', label + ' today: ' + d.text, hair);
+    }
+    function cCasino(c) {
+      const S = Settings.get(); const goal = S.goals.casino;
+      if (c.state !== 'ok') return cPlaceholder('casino', c, 'Casino tokens');
+      const v = (c.m.lowerBound ? '\u2265' : '') + U.int(c.m.spent);
+      const val = v + (goal ? '<span class="trt-cg">/' + U.int(goal) + '</span>' : '');
+      const hair = (S.modules.goalProgress && !c.goal.off && U.isNum(c.goal.pct)) ? c.goal.pct : null;
+      return crow(ICON.casino, 'casino', val, c.goal.complete ? '\u2713' : '', 'Casino tokens spent today: ' + v, hair);
+    }
+    function cOc(oc) {
+      if (oc.state === 'ok' && oc.active && U.isNum(oc.readyAt)) return crow(ICON.oc, 'oc', cdSpan(oc.readyAt, 'short', 'Ready'), '', 'Next organized crime: ' + oc.name, null);
+      if (oc.state === 'ok' && oc.active) return crow(ICON.oc, 'oc', '<span class="trt-cg">open</span>', '', oc.name + ': recruiting, no ready time yet', null);
+      if (oc.state === 'loading') return crow(ICON.oc, 'oc', '<span class="trt-cg">\u2026</span>', '', 'Organized crime: loading', null);
+      return crow(ICON.oc, 'oc', '<span class="trt-cg">\u2013</span>', '', 'No active organized crime', null);
+    }
+    function cTravel(t) {
+      const v = t.page && t.page.available && t.page.ours ? (t.page.torn || t.page.ours) : t.verdict;
+      const txt = v === 'SAFE' ? '\u2713 Safe' : v === 'CAUTION' ? '\u26A0 Caution' : v === 'CONFLICT' ? '\u2715 Conflict' : '\u2013';
+      return crow(ICON.travel, 'oc', '<span class="' + (v === 'CONFLICT' ? 'trt-bad' : v === 'CAUTION' ? 'trt-warn' : 'trt-cg') + '">' + txt + '</span>', '', 'Travel / OC check', null);
+    }
+    function cCd(key, c, label) {
+      if (c.state !== 'ok') return crow(ICON[key], 'oc', '<span class="trt-cg">\u2026</span>', '', label, null);
+      return crow(ICON[key], 'oc', cdSpan(c.target, 'hms', 'Ready'), '', label, null);
+    }
+    function tileHtml(vm) {
+      const c = vm.S.compact; const rows = [];
+      if (vm.key.state === 'none') rows.push('<div class="trt-cempty">' + ICON.key + ' Add a Full Access API key</div>');
+      else if (vm.key.state === 'halted') rows.push('<div class="trt-cempty trt-bad">\u26A0 API key rejected</div>');
+      else {
+        if (c.energy) rows.push(cLog('energy', vm.energy, 'E', 'Energy'));
+        if (c.nerve) rows.push(cLog('nerve', vm.nerve, 'N', 'Nerve'));
+        if (c.xanax) rows.push(cCounter('xanax', vm.xanax, 'Xanax'));
+        if (c.city) rows.push(cCounter('city', vm.city, 'City shop'));
+        if (c.casino) rows.push(cCasino(vm.casino));
+        if (c.oc) rows.push(cOc(vm.oc));
+        if (c.travel) rows.push(cTravel(vm.travel));
+        if (c.drug) rows.push(cCd('drug', vm.cooldowns.drug, 'Drug cooldown'));
+        if (c.booster) rows.push(cCd('booster', vm.cooldowns.booster, 'Booster cooldown'));
+        if (c.medical) rows.push(cCd('medical', vm.cooldowns.medical, 'Medical cooldown'));
+        if (c.newDay) rows.push(crow(ICON.newDay, 'oc', cdSpan(vm.newDay.at, 'hms', '00:00:00'), '', 'New day in (TCT)', null));
+        if (!rows.length) rows.push('<div class="trt-cempty">Choose rows in settings</div>');
+      }
+      return '<div class="trt-day" style="width:' + pct(vm.newDay.frac) + '"></div>' + rows.join('');
+    }
+
+    // ------------------------------------------------------------ expanded
+    function goalBlock(g, unitText, color) {
+      if (g.off) return '<div class="trt-goalrow"><span>Personal goal off</span></div>';
+      if (g.unknown) return '<div class="trt-goalrow"><span>Personal goal <b>' + U.int(g.goal) + unitText + '</b></span><span>? Not known yet</span></div>';
+      const right = g.complete
+        ? '<span class="trt-good">\u2713 Goal complete' + (g.over ? ', +' + U.int(g.over) + unitText : '') + '</span>'
+        : '<span>\u25CB ' + U.int(g.remaining) + unitText + ' remaining</span>';
+      return '<div class="trt-goalrow"><span>Personal goal <b>' + U.int(g.goal) + unitText + '</b></span>' + right + '</div>'
+        + (Settings.get().modules.goalProgress ? bar(g.pct, color) : '');
+    }
+    function stateNote(sec, key) {
+      switch (sec.state) {
+        case 'nokey': return note('Add an API key in settings to start tracking.');
+        case 'needs':
+          if (key === 'energy' || key === 'nerve') {
+            return note('This needs a Full Access key. Torn only records ' + key + ' spending in your activity log, and only shares that log with Full Access keys (or custom keys that include the "log" selection).')
+              + '<div class="trt-btnrow">' + linkBtn('settings', 'Open settings') + '</div>';
+          }
+          if (key === 'casino') return note('Torn only shares your casino token balance with Limited Access keys or higher.');
+          return note('Your API key does not include the selection this section needs.');
+        case 'off': return note('Reading the activity log is turned off in settings.');
+        case 'error': return note('Could not load: ' + U.esc((sec.error && sec.error.message) || 'unknown error') + '. Retrying automatically.');
+        default: return note('Loading\u2026');
+      }
+    }
+    function logSec(key, sec, unit, label, breakdown) {
+      let body = '';
+      if (sec.state === 'ok') {
+        const pre = sec.conf === Ledger.CONF.V ? '' : '\u2265';
+        body += '<div class="trt-big"><span class="trt-bv">' + pre + U.int(sec.total) + ' ' + unit + '</span><span class="trt-bu">used today</span></div>';
+        body += goalBlock(sec.goal, ' ' + unit, key);
+        if (breakdown) {
+          const rows = sec.cats.map((c) => kv(U.esc(c.name), U.int(c.value) + ' ' + unit, confMark(sec.conf)));
+          if (sec.unknown) rows.push(kv(key === 'energy' ? 'Gym trains with no energy value' : 'Crime actions with no nerve value', U.int(sec.unknown), confMark('UNKNOWN')));
+          if (!rows.length) rows.push(kv('Nothing spent yet today', '', ''));
+          body += '<div class="trt-kv">' + rows.join('') + '</div>';
+        }
+        if (!sec.complete) body += note("Still reading today's activity log, so the total can grow.");
+        else if (sec.unknown) body += note('Some log entries had no value, so the real total can be higher.');
+      } else body += stateNote(sec, key);
+      if (sec.bar && U.isNum(sec.bar.current)) {
+        body += note('Current ' + label.toLowerCase() + ' <b class="trt-num">' + U.int(sec.bar.current) + '</b> (bar maximum ' + U.int(sec.bar.maximum) + ')' + staleBadge(sec.barStale));
+      }
+      return section(key, ICON[key], label, sec.state === 'ok' ? confMark(sec.conf) : '', body);
+    }
+    function cdLine(label, c) {
+      const v = c.state === 'ok' ? cdSpan(c.target, 'hms', 'Ready') : '<span class="trt-muted">?</span>';
+      return '<div class="trt-kv">' + kv(U.esc(label), v, c.stale ? '<span title="Not refreshed recently">!</span>' : '') + '</div>';
+    }
+    function xanaxSec(vm) {
+      const s = vm.xanax; let body = '';
+      if (s.state === 'ok') {
+        const goal = vm.S.goals.xanax;
+        body += '<div class="trt-big"><span class="trt-bv">' + U.esc(s.disp.text) + (goal ? '<span class="trt-bu"> / ' + U.int(goal) + '</span>' : '') + '</span><span class="trt-bu">taken today</span></div>';
+        body += goalBlock(s.goal, '', 'xanax');
+        if (s.disp.conf !== Ledger.CONF.V && s.m.why) body += note(U.esc(s.m.why));
+      } else body += stateNote(s, 'xanax');
+      if (vm.S.modules.drugCd) body += cdLine('Drug cooldown', vm.cooldowns.drug);
+      return section('xanax', ICON.xanax, 'Xanax', s.state === 'ok' ? confMark(s.disp.conf) : '', body);
+    }
+    function citySec(vm) {
+      const s = vm.city; let body = '';
+      if (s.state === 'ok') {
+        const goal = vm.S.goals.city;
+        body += '<div class="trt-big"><span class="trt-bv">' + U.esc(s.disp.text) + (goal ? '<span class="trt-bu"> / ' + U.int(goal) + '</span>' : '') + '</span><span class="trt-bu">items bought today</span></div>';
+        body += goalBlock(s.goal, '', 'city');
+        if (U.isNum(s.allowanceLeft)) {
+          body += note((s.allowanceUsedExact ? '' : 'At most ') + '<b class="trt-num">' + U.int(s.allowanceLeft) + "</b> of Torn's " + CITY_DAILY_ALLOWANCE + '-item daily allowance left');
+        }
+        if (s.disp.conf !== Ledger.CONF.V && s.m.why) body += note(U.esc(s.m.why));
+      } else body += stateNote(s, 'city');
+      return section('city', ICON.city, 'City shop', s.state === 'ok' ? confMark(s.disp.conf) : '', body);
+    }
+    function refillWord(r) {
+      if (!r || r.state === 'unknown') return '<span class="trt-muted">?</span>';
+      if (r.state === 'stale') return '<span class="trt-muted">Checking after New Day</span>';
+      return r.used ? '<span class="trt-muted">Used</span>' : '<span class="trt-good">Available</span>';
+    }
+    function casinoSec(vm) {
+      const c = vm.casino; let body = '';
+      if (c.state === 'ok') {
+        const m = c.m;
+        body += '<div class="trt-big"><span class="trt-bv">' + (m.lowerBound ? '\u2265' : '') + U.int(m.spent) + '</span><span class="trt-bu">tokens spent today</span></div>';
+        body += goalBlock(c.goal, '', 'casino');
+        const rows = [kv('Daily base from Torn', U.int(c.base), '')];
+        rows.push(kv('Current balance', U.isNum(c.balance) ? U.int(c.balance) + (c.balanceStale ? ' !' : '') : '?', ''));
+        if (m.grant !== null) rows.push(kv('New Day grant seen', '+' + U.int(m.grant), ''));
+        if (m.gained) rows.push(kv('Other tokens gained', '+' + U.int(m.gained), ''));
+        rows.push(kv('Casino refill', refillWord(c.refill), ''));
+        body += '<div class="trt-kv">' + rows.join('') + '</div>';
+        body += note(m.lowerBound
+          ? 'Spending is measured from changes in your token balance. The tracker was not watching for part of today, so the real number can be higher.'
+          : 'Measured from changes in your token balance, watched continuously since New Day.');
+      } else {
+        body += stateNote(c, 'casino');
+        body += '<div class="trt-kv">' + kv('Daily base from Torn', U.int(c.base), '') + kv('Casino refill', refillWord(c.refill), '') + '</div>';
+      }
+      return section('casino', ICON.casino, 'Casino tokens', c.state === 'ok' ? confMark(c.m.conf) : '', body);
+    }
+    function refillsSec(vm) {
+      const r = vm.refills; let body;
+      if (r.nokey) body = note('Add an API key in settings to see refills.');
+      else {
+        const rows = [kv('Energy refill', refillWord(r.energy), confMark(r.energy.conf)), kv('Nerve refill', refillWord(r.nerve), confMark(r.nerve.conf)), kv('Casino refill', refillWord(r.token), confMark(r.token.conf))];
+        if (U.isNum(r.special) && r.special > 0) rows.push(kv('Special refills', U.int(r.special), ''));
+        body = '<div class="trt-kv">' + rows.join('') + '</div>' + note('The tracker only reports refills. It never uses them.');
+      }
+      return section('refills', ICON.refills, 'Refills', '', body);
+    }
+    function cdSec(vm) {
+      const M = vm.S.modules; const c = vm.cooldowns; const rows = [];
+      const one = (label, x) => kv(label, x.state === 'ok' ? cdSpan(x.target, 'hms', 'Ready') : '<span class="trt-muted">?</span>', x.stale ? '<span title="Not refreshed recently">!</span>' : '');
+      if (M.drugCd) rows.push(one('Drug', c.drug));
+      if (M.boosterCd) rows.push(one('Booster', c.booster));
+      if (M.medicalCd) rows.push(one('Medical', c.medical));
+      return section('cooldowns', ICON.cd, 'Cooldowns', '', '<div class="trt-kv">' + rows.join('') + '</div>');
+    }
+    function ocSec(vm) {
+      const oc = vm.oc; let body = ''; let right = '';
+      if (oc.state === 'ok') {
+        body += '<div class="trt-big"><span class="trt-bv" style="font-size:1.2em">' + U.esc(oc.name) + '</span></div>';
+        if (oc.active && U.isNum(oc.readyAt) && oc.readyAt > Time.now()) {
+          body += '<div class="trt-kv">' + kv('Ready in', cdSpan(oc.readyAt, 'long', 'now'), '') + kv('Ready at', tctHM(oc.readyAt) + ' TCT', '') + kv('Status', U.esc(oc.status), '') + '</div>';
+        } else if (oc.active && U.isNum(oc.readyAt)) {
+          body += note('<span class="trt-warn">\u26A0 Planning time is over and the crime is waiting to start.</span> It starts only when every member is in Torn and out of hospital.');
+        } else if (oc.active) {
+          body += note('Recruiting: ' + oc.filled + ' of ' + oc.slots + ' slots filled. No ready time until planning can finish.');
+        } else {
+          body += note(U.esc(oc.status) + (U.isNum(oc.executedAt) ? ', executed ' + agoSpan(oc.executedAt) : '') + '. No upcoming crime.');
+        }
+        if (oc.stale) right = staleBadge(true);
+      } else if (oc.state === 'none') body += note('You are not in an organized crime right now.');
+      else if (oc.state === 'notmigrated') body += note('Your faction is not on Organized Crimes 2.0.');
+      else if (oc.state === 'needs') body += note('Your API key does not include the organized crime selection.');
+      else if (oc.state === 'nokey') body += note('Add an API key in settings to see your organized crime.');
+      else body += note('Loading\u2026');
+      return section('oc', ICON.oc, 'Next organized crime', right, body);
+    }
+    function travelSec(vm) {
+      const t = vm.travel; let body = '';
+      const buf = Math.round(t.buffer / 60000);
+      if (t.state === 'ok') {
+        const where = t.where === 'torn' ? 'You are in Torn.'
+          : t.where === 'returning' ? 'Flying back to Torn, landing in ' + cdSpan(t.returnAt, 'short', 'now') + '.'
+          : t.where === 'outbound' ? 'Flying to ' + U.esc(t.dest) + (U.isNum(t.landsAt) ? ', landing in ' + cdSpan(t.landsAt, 'short', 'now') : '') + '.'
+          : 'In ' + U.esc(t.dest) + '.';
+        body += '<div class="trt-big">' + verdictPill(t.verdict) + '<span class="trt-bu">' + where + '</span></div>';
+        const rows = [];
+        if (U.isNum(t.readyAt)) rows.push(kv('OC ready at', tctHM(t.readyAt) + ' TCT', ''));
+        if (t.where !== 'torn' && U.isNum(t.returnAt)) rows.push(kv(t.where === 'returning' ? 'Back in Torn' : 'Earliest return', '~' + tctHM(t.returnAt) + ' TCT', ''));
+        if (rows.length) body += '<div class="trt-kv">' + rows.join('') + '</div>';
+        if (t.verdict === 'CONFLICT') body += note('You would still be away when your OC is ready, which delays it for the whole team.');
+        else if (t.verdict === 'CAUTION') body += note('Your return is within your ' + buf + '-minute safety buffer.');
+        else if (t.verdict === 'SAFE') body += note('No conflict detected.');
+        if (t.stale) body += note('Travel data is stale.' + staleBadge(true));
+      } else body += note(vm.key.state === 'none' ? 'Add an API key in settings to check travel.' : 'Waiting for travel data\u2026');
+      const p = t.page;
+      if (p && p.available) {
+        body += '<div class="trt-note" style="margin-top:.55em"><b>Travel page</b></div>';
+        if (p.dest) {
+          const rows = [kv('Destination', U.esc(p.dest) + (p.type ? ' (' + U.esc(p.type) + ')' : ''), '')];
+          if (U.isNum(p.flightMs)) rows.push(kv('Round trip', '~' + U.long(2 * p.flightMs * 1.03 + t.stay), ''));
+          rows.push(kv("Torn's check", p.torn ? verdictPill(p.torn) : '<span class="trt-muted">not shown</span>', ''));
+          if (p.ours) rows.push(kv('Tracker estimate', p.oursNoOc ? verdictPill(null) : verdictPill(p.ours), ''));
+          body += '<div class="trt-kv">' + rows.join('') + '</div>';
+          if (p.differs) body += note('<span class="trt-warn">\u26A0 The two checks disagree.</span> Torn calculates its own flag on the server; the tracker adds a 3% flight variance, your planned stay and your buffer.');
+        } else body += note('Select a destination to check it against your OC.');
+        if (p.flagged && p.flagged.length) body += note('Torn flags ' + p.flagged.length + ' destination' + (p.flagged.length === 1 ? '' : 's') + ' for this travel type: ' + p.flagged.map(U.esc).join(', ') + '.');
+      } else if (p && !p.available) body += note(U.esc(p.reason || 'Travel page data not available.'));
+      body += note('Uses a planned stay of ' + Math.round(t.stay / 60000) + ' min and a ' + buf + '-minute buffer. Nothing is clicked or blocked.');
+      return section('travel', ICON.travel, 'Travel and OC', '', body);
+    }
+    function bannerHtml(vm) {
+      const b = (title, text, cls) => '<div class="trt-banner"><b class="' + (cls || '') + '">' + U.esc(title) + '</b>' + text + '</div>';
+      switch (vm.key.state) {
+        case 'none': return b('API key required', 'Add a Full Access key to use every feature. Energy and nerve usage only work with Full Access. ' + linkBtn('settings', 'Open settings'));
+        case 'halted': return b(vm.key.message || 'Torn rejected the API key.', 'The tracker stopped using this key. ' + linkBtn('settings', 'Update key') + ' ' + linkBtn('retry-key', 'Try again'), 'trt-bad');
+        case 'error': return b('Could not check the API key', U.esc(vm.key.message || '') + ' ' + linkBtn('retry-key', 'Try again'), 'trt-warn');
+        case 'checking': return b('Checking your API key\u2026', '');
+        default: return fullKeyBanner(vm, b);
+      }
+    }
+    // A key that cannot read the activity log gets a plain explanation of what is missing.
+    // Hidden when the energy and nerve sections are turned off, or log reading is off.
+    function fullKeyBanner(vm, b) {
+      const S = vm.S;
+      if (vm.key.state !== 'ok' || vm.logsUsable || !S.useLogs || !(S.modules.energy || S.modules.nerve)) return '';
+      const a = vm.access || {};
+      const what = Data.meta.logAccessDenied ? 'Torn did not let this key read your activity log'
+        : /custom/i.test(a.type || '') ? 'Your key is a custom key without the "log" selection'
+        : 'Your key is ' + U.esc(a.type || 'not a Full Access key');
+      return b('Full Access key needed for energy and nerve', what + ', so energy and nerve used today stay empty. Everything else works. ' + linkBtn('settings', 'Open settings'), 'trt-warn');
+    }
+    function mainHtml(vm) {
+      const M = vm.S.modules; const out = [];
+      if (M.energy) out.push(logSec('energy', vm.energy, 'E', 'Energy', M.energyBreakdown));
+      if (M.nerve) out.push(logSec('nerve', vm.nerve, 'N', 'Nerve', M.nerveBreakdown));
+      if (M.xanax) out.push(xanaxSec(vm));
+      if (M.city) out.push(citySec(vm));
+      if (M.casino) out.push(casinoSec(vm));
+      if (M.refills) out.push(refillsSec(vm));
+      if (M.drugCd || M.boosterCd || M.medicalCd) out.push(cdSec(vm));
+      if (M.oc) out.push(ocSec(vm));
+      if (M.travel) out.push(travelSec(vm));
+      if (!out.length) out.push('<div class="trt-sec">' + note('All sections are hidden. Turn some on in settings.') + '</div>');
+      return out.join('');
+    }
+    function footHtml(vm) {
+      const st = vm.status; const extra = [];
+      if (st.paused) extra.push(U.esc(st.paused.reason));
+      if (st.coreError && st.coreError.code !== 'halted') extra.push('Last refresh failed: ' + U.esc(st.coreError.message || ''));
+      if (st.timeSource === 'local-utc') extra.push('Using your computer clock in UTC until Torn responds.');
+      return '<div class="trt-foot"><div class="trt-footrow"><span>' + (st.lastCoreAt ? 'Updated ' + agoSpan(st.lastCoreAt) : 'Not updated yet')
+        + (vm.coreStale && st.lastCoreAt ? staleBadge(true) : '') + '</span><span>' + U.esc(accessLabel(vm.access)) + '</span></div>'
+        + extra.map((x) => '<div>' + x + '</div>').join('') + '</div>';
+    }
+    function supportHtml() {
+      return '<div class="trt-support">Like the script?<br>Send a Xanax to <a href="' + SUPPORT.url + '" target="_blank" rel="noopener noreferrer">'
+        + SUPPORT.name + ' [' + SUPPORT.id + ']</a></div>';
+    }
+
+    // ------------------------------------------------------------ settings
+    function chk(path, label, on) {
+      return '<label class="trt-check"><input type="checkbox" data-set="' + path + '"' + (on ? ' checked' : '') + '><span>' + U.esc(label) + '</span></label>';
+    }
+    function selectHtml(path, options, value, label) {
+      return '<select data-set="' + path + '" aria-label="' + U.esc(label) + '">' + options.map((o) => '<option value="' + U.esc(o[0]) + '"' + (String(o[0]) === String(value) ? ' selected' : '') + '>' + U.esc(o[1]) + '</option>').join('') + '</select>';
+    }
+    function armedLabel(act, label) { return (armed[act] && armed[act] > Date.now()) ? 'Click again to confirm' : label; }
+    function settingsHtml(vm) {
+      const S = vm.S; const key = Api.getKey(); const src = Api.keySource(); const a = vm.access;
+      const masked = key ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' + key.slice(-4) : 'None';
+      const has = (sel) => (a && a.sel.includes(sel));
+      const feat = (label, ok, need) => kv(U.esc(label), ok ? '<span class="trt-good">\u2713</span>' : '<span class="trt-muted">' + U.esc(need) + '</span>', '');
+      let out = '';
+      // API key
+      out += '<div class="trt-sec"><div class="trt-st">API key</div>'
+        + '<div class="trt-field"><span>Current key</span><span class="trt-num">' + masked + '</span></div>'
+        + '<div class="trt-field"><span>Source</span><span>' + (src === 'saved' ? 'Saved in this browser' : src === 'tornpda' ? 'TornPDA' : 'None') + '</span></div>'
+        + '<div class="trt-field"><span>Access</span><span>' + (vm.key.state === 'ok' ? U.esc(a.type || '') : vm.key.state === 'halted' ? '<span class="trt-bad">Rejected</span>' : vm.key.state === 'none' ? '\u2013' : 'Checking\u2026') + '</span></div>'
+        + '<label class="trt-field"><span>New key</span><input type="password" maxlength="16" autocomplete="off" spellcheck="false" data-keyinput placeholder="16 characters"></label>'
+        + '<div class="trt-btnrow"><button type="button" class="trt-btn" data-act="save-key">Save and test</button>'
+        + (src === 'saved' ? '<button type="button" class="trt-btn trt-danger" data-act="remove-key">' + armedLabel('remove-key', 'Remove key') + '</button>' : '')
+        + '<a class="trt-btn" href="' + TORN_API_SETTINGS_URL + '" target="_blank" rel="noopener noreferrer">Create a Full Access key on Torn</a></div>'
+        + (notice && notice.where === 'key' ? '<div class="trt-notice trt-' + notice.kind + '">' + U.esc(notice.text) + '</div>' : '')
+        + note('Use a Full Access key to get every feature. Energy and nerve used today come only from your Torn activity log, and Torn only shares that log with Full Access keys (or custom keys that include the "log" selection). A Limited Access key still works for everything else. The tracker never asks Torn for more than the key allows.')
+        + (vm.key.state === 'ok' ? '<div class="trt-kv" style="margin-top:.4em">'
+          + feat('Energy and nerve used today', a.log && !Data.meta.logAccessDenied, 'needs Full Access')
+          + feat('Xanax and City shop', has('personalstats'), 'needs personalstats')
+          + feat('Casino tokens', has('casino'), 'needs Limited')
+          + feat('Refills, cooldowns, bars', has('refills') && has('cooldowns') && has('bars'), 'missing selections')
+          + feat('Organized crime', has('organizedcrime'), 'missing selection')
+          + feat('Travel', has('travel'), 'missing selection') + '</div>' : '')
+        + '<div style="margin-top:.45em">' + chk('useLogs', 'Read my activity log when the key allows it', S.useLogs) + '</div>'
+        + '<table class="trt-tbl" aria-label="API terms of service"><tr><th>Data storage</th><td>Only locally</td></tr><tr><th>Data sharing</th><td>Nobody</td></tr>'
+        + '<tr><th>Purpose of use</th><td>Personal daily tracking of your own resources</td></tr><tr><th>Key storage and sharing</th><td>Stored locally / Not shared</td></tr>'
+        + '<tr><th>Key access level</th><td>Full Access (needed for energy and nerve usage; Limited Access works for everything else)</td></tr></table></div>';
+      // Goals
+      const goalRow = (k, label) => {
+        const off = S.goals[k] === null;
+        return '<div class="trt-field"><span>' + label + '</span><span class="trt-inline"><input type="number" min="1" step="1" inputmode="numeric" aria-label="' + label + ' goal" data-set="goals.' + k + '" value="' + (off ? '' : S.goals[k]) + '"' + (off ? ' disabled' : '') + '>'
+          + '<label class="trt-check"><input type="checkbox" data-goaloff="' + k + '"' + (off ? ' checked' : '') + '><span>Off</span></label></span></div>';
+      };
+      out += '<div class="trt-sec"><div class="trt-st">Daily goals</div>' + note('Personal targets only. They are not Torn limits, and usage keeps counting after you reach them.')
+        + goalRow('energy', 'Energy') + goalRow('nerve', 'Nerve') + goalRow('xanax', 'Xanax') + goalRow('city', 'City shop items') + goalRow('casino', 'Casino tokens') + '</div>';
+      // Collapsed view
+      const C = S.compact;
+      out += '<div class="trt-sec"><div class="trt-st">Small window shows</div><div class="trt-checks">'
+        + chk('compact.energy', 'Energy', C.energy) + chk('compact.nerve', 'Nerve', C.nerve) + chk('compact.xanax', 'Xanax', C.xanax) + chk('compact.city', 'City shop', C.city)
+        + chk('compact.casino', 'Casino', C.casino) + chk('compact.oc', 'Organized crime', C.oc) + chk('compact.travel', 'Travel check', C.travel) + chk('compact.drug', 'Drug cooldown', C.drug)
+        + chk('compact.booster', 'Booster cooldown', C.booster) + chk('compact.medical', 'Medical cooldown', C.medical) + chk('compact.newDay', 'New day timer', C.newDay) + '</div>'
+        + '<div class="trt-field"><span>Energy and nerve as</span>' + selectHtml('energyFormat', [['goal', '650/500 (used/goal)'], ['plain', '650 E (used only)']], S.energyFormat, 'Energy and nerve format') + '</div></div>';
+      // Expanded sections
+      const M = S.modules;
+      out += '<div class="trt-sec"><div class="trt-st">Expanded view shows</div><div class="trt-checks">'
+        + chk('modules.energy', 'Energy', M.energy) + chk('modules.energyBreakdown', 'Energy breakdown', M.energyBreakdown) + chk('modules.nerve', 'Nerve', M.nerve) + chk('modules.nerveBreakdown', 'Nerve breakdown', M.nerveBreakdown)
+        + chk('modules.xanax', 'Xanax', M.xanax) + chk('modules.city', 'City shop', M.city) + chk('modules.casino', 'Casino tokens', M.casino) + chk('modules.refills', 'Refills', M.refills)
+        + chk('modules.drugCd', 'Drug cooldown', M.drugCd) + chk('modules.boosterCd', 'Booster cooldown', M.boosterCd) + chk('modules.medicalCd', 'Medical cooldown', M.medicalCd) + chk('modules.oc', 'Organized crime', M.oc)
+        + chk('modules.travel', 'Travel warning', M.travel) + chk('modules.goalProgress', 'Goal progress bars', M.goalProgress) + chk('modules.confidence', 'Confidence marks', M.confidence) + chk('modules.newDay', 'New day timer', M.newDay)
+        + chk('modules.support', 'Support message', M.support) + '</div>'
+        + note('Confidence marks: \u2713 verified from Torn data, ~ inferred, \u2248 estimated, ? unknown.') + '</div>';
+      // Display
+      out += '<div class="trt-sec"><div class="trt-st">Display</div>'
+        + '<div class="trt-field"><span>Size</span>' + selectHtml('ui.scale', [[80, '80%'], [90, '90%'], [100, '100%'], [110, '110%'], [120, '120%']], S.ui.scale, 'Size') + '</div>'
+        + '<div class="trt-field"><span>Position</span>' + selectHtml('ui.corner', [['top-left', 'Top left'], ['top-right', 'Top right'], ['bottom-left', 'Bottom left'], ['bottom-right', 'Bottom right']].concat(S.ui.pos ? [['custom', 'Custom (dragged)']] : []), S.ui.corner, 'Position') + '</div>'
+        + note('Drag the small window, or the header of this panel, to move it. Light and dark colors follow your Torn theme.')
+        + '<div class="trt-btnrow"><button type="button" class="trt-btn" data-act="reset-position">Reset position</button></div>'
+        + (canHide() ? note(hasMenu ? 'Hidden? Use your userscript manager menu: Show tracker. Keyboard: Alt+Shift+D.' : 'Hidden? Press Alt+Shift+D to show it again.') : note('Hiding is turned off here because this app has no userscript menu to bring the tracker back. Minimize it instead.'))
+        + '</div>';
+      // Travel + refresh
+      out += '<div class="trt-sec"><div class="trt-st">Travel check</div>'
+        + '<div class="trt-field"><span>Planned time abroad (min)</span><input type="number" min="0" max="1440" step="1" data-set="travel.stayMinutes" value="' + S.travel.stayMinutes + '" aria-label="Planned time abroad in minutes"></div>'
+        + '<div class="trt-field"><span>Safety buffer (min)</span><input type="number" min="0" max="720" step="1" data-set="travel.bufferMinutes" value="' + S.travel.bufferMinutes + '" aria-label="Safety buffer in minutes"></div>'
+        + '</div><div class="trt-sec"><div class="trt-st">Refresh</div>'
+        + '<div class="trt-field"><span>Live data every</span>' + selectHtml('refresh.coreSec', [[30, '30 seconds'], [60, '60 seconds'], [120, '2 minutes']], S.refresh.coreSec, 'Refresh interval') + '</div>'
+        + note('Countdowns tick locally every second. One Torn tab does the API requests for all your Torn tabs.') + '</div>';
+      // Data
+      const recent = Data.hist.slice(-7).reverse();
+      const cell = (x, f) => (x ? f(x) : '\u2013');
+      out += '<div class="trt-sec"><div class="trt-st">Your data</div>'
+        + note('Daily totals are archived at every New Day (00:00 TCT) and kept for 90 days. Exports never include your API key.')
+        + (recent.length ? '<table class="trt-tbl"><tr><th>Day</th><th>E</th><th>N</th><th>Xan</th><th>City</th><th>Casino</th></tr>'
+          + recent.map((h) => '<tr><td>' + U.esc(h.date.slice(5)) + '</td><td>' + cell(h.energy, (x) => U.int(x.total)) + '</td><td>' + cell(h.nerve, (x) => U.int(x.total)) + '</td><td>'
+            + cell(h.xanax, (x) => (U.isNum(x.value) ? U.int(x.value) : '\u2265' + U.int(x.min))) + '</td><td>' + cell(h.city, (x) => (U.isNum(x.value) ? U.int(x.value) : '\u2265' + U.int(x.min))) + '</td><td>'
+            + cell(h.casino, (x) => U.int(x.spent)) + '</td></tr>').join('') + '</table>' : '')
+        + '<div class="trt-btnrow"><button type="button" class="trt-btn" data-act="export">Export data</button></div>'
+        + (exportText ? '<textarea readonly data-export aria-label="Exported data">' + U.esc(exportText) + '</textarea><div class="trt-btnrow"><button type="button" class="trt-btn" data-act="copy-export">Copy</button><button type="button" class="trt-btn" data-act="download-export">Download file</button></div>' : '')
+        + '<div style="margin-top:.6em">Import</div><textarea data-import placeholder="Paste exported data here" aria-label="Data to import"></textarea>'
+        + '<div class="trt-btnrow"><button type="button" class="trt-btn" data-act="import">Import</button>'
+        + '<button type="button" class="trt-btn trt-danger" data-act="reset-history">' + armedLabel('reset-history', 'Reset history') + '</button>'
+        + '<button type="button" class="trt-btn trt-danger" data-act="reset-settings">' + armedLabel('reset-settings', 'Reset settings') + '</button></div>'
+        + (notice && notice.where === 'data' ? '<div class="trt-notice trt-' + notice.kind + '">' + U.esc(notice.text) + '</div>' : '') + '</div>';
+      // Privacy + compliance
+      out += '<div class="trt-sec"><div class="trt-st">Privacy</div>'
+        + note('Your API key is stored locally in this userscript\'s storage (on TornPDA, in the app\'s storage for torn.com).')
+        + note('The tracker talks only to Torn\'s official API at https://api.torn.com. Your key is never sent anywhere else.')
+        + note('No analytics or telemetry are collected. All history stays in your browser.')
+        + note('On the Travel page the tracker reads the travel data Torn already loaded on that page. It never loads pages in the background.')
+        + '</div><div class="trt-sec"><div class="trt-st">Torn compliance</div>'
+        + note('This userscript is designed as a read-only information tool. It uses Torn API data and, where applicable, data from Torn pages the player is actively viewing.')
+        + note('It does not automate attacks, travel, purchases, item use, refills, Casino actions, CAPTCHA interaction, or other gameplay. Users should review Torn\'s current rules and API terms before use.')
+        + note('Designed around Torn\'s published API and scripting rules.')
+        + note('Version ' + TRT_VERSION + '. Storage: ' + Store.backend + '. Tab role: ' + (Sync.isLeader() ? 'fetching data' : 'showing shared data') + '.') + '</div>';
+      return out;
+    }
+
+    // ------------------------------------------------------------ panel
+    function panelHtml(vm) {
+      const S = vm.S;
+      const head = '<div class="trt-day" style="width:' + pct(vm.newDay.frac) + '" title="Share of the Torn day already gone"></div>'
+        + '<div class="trt-head" data-drag="head"><div class="trt-titles"><div class="trt-title">' + (view === 'settings' ? 'Tracker settings' : 'Torn day') + '</div>'
+        + '<div class="trt-sub"><span>' + U.esc(dayLabel(vm.dayKey)) + '</span><span><span data-trt-clock>' + Time.fmtTct(Time.now()) + '</span> TCT</span>'
+        + (S.modules.newDay ? '<span>New day in ' + cdSpan(vm.newDay.at, 'hms', '00:00:00') + '</span>' : '') + '</div></div><div class="trt-actions">'
+        + (view === 'settings' ? ib('back', '\u2190', 'Back to tracker') : ib('refresh', '\u21BB', 'Refresh now', Date.now() - manualAt < 10000 || vm.key.state === 'none') + ib('settings', '\u2699\uFE0F', 'Settings'))
+        + ib('collapse', '\u2013', 'Minimize') + (canHide() ? ib('hide', '\u00D7', 'Hide') : '') + '</div></div>';
+      if (view === 'settings') return head + '<div class="trt-body">' + settingsHtml(vm) + '</div>';
+      return head + bannerHtml(vm) + '<div class="trt-body">' + mainHtml(vm) + '</div>' + footHtml(vm) + (S.modules.support ? supportHtml() : '');
+    }
+
+    // ------------------------------------------------------------ render
+    function requestRender(reason) {
+      reasons.add(reason || 'data');
+      if (queued) return;
+      queued = true;
+      const run = () => { queued = false; const r = new Set(reasons); reasons.clear(); render(r); };
+      if (typeof requestAnimationFrame === 'function' && !document.hidden) requestAnimationFrame(run); else setTimeout(run, 30);
+    }
+    function render(why) {
+      if (!root) return;
+      const S = Settings.get();
+      // Typing in settings must never be interrupted by background data updates.
+      if (why && view === 'settings' && boxKind === 'panel' && S.ui.state === 'expanded' && !why.has('settings') && !why.has('ui') && !why.has('theme') && !why.has('state')) { tick(); return; }
+      const vm = Model.compute();
+      root.className = 'trt-root ' + (Theme.isDark() ? 'trt-dark' : 'trt-light');
+      root.setAttribute('data-state', S.ui.state);
+      root.style.fontSize = (12 * S.ui.scale / 100) + 'px';
+      if (S.ui.state === 'hidden') { applyPosition(); return; }
+      const kind = S.ui.state === 'expanded' ? 'panel' : 'tile';
+      let scroll = 0; let focusId = null; const keep = {};
+      if (box && boxKind === 'panel' && kind === 'panel') {
+        const b = box.querySelector('.trt-body'); if (b) scroll = b.scrollTop;
+        const f = document.activeElement;
+        if (f && box.contains(f)) focusId = f.getAttribute('data-set') || (f.getAttribute('data-goaloff') && 'goaloff:' + f.getAttribute('data-goaloff')) || f.getAttribute('data-act') || (f.hasAttribute('data-keyinput') ? 'keyinput' : null);
+        const ki = box.querySelector('[data-keyinput]'); if (ki) keep.key = ki.value;
+        const im = box.querySelector('[data-import]'); if (im) keep.imp = im.value;
+      }
+      if (!box || boxKind !== kind) {
+        root.textContent = '';
+        box = document.createElement('div');
+        box.className = kind === 'panel' ? 'trt-panel trt-opening' : 'trt-tile';
+        if (kind === 'tile') { box.setAttribute('data-drag', 'tile'); box.setAttribute('role', 'button'); box.setAttribute('tabindex', '0'); box.setAttribute('aria-expanded', 'false'); }
+        else { box.setAttribute('role', 'region'); box.setAttribute('aria-label', 'Torn daily resource tracker'); setTimeout(() => box && box.classList.remove('trt-opening'), 250); }
+        root.appendChild(box);
+        boxKind = kind;
+      }
+      box.innerHTML = kind === 'panel' ? panelHtml(vm) : tileHtml(vm);
+      if (kind === 'tile') {
+        box.classList.toggle('trt-stale', vm.key.state === 'ok' && !!vm.status.lastCoreAt && vm.coreStale);
+        box.setAttribute('aria-label', 'Torn daily tracker. Press Enter to expand.');
+        box.title = 'Torn day ' + Math.round(vm.newDay.frac * 100) + '% done. New day in ' + U.long(vm.newDay.at - vm.now) + ' (TCT). Click to expand, drag to move.';
+      } else {
+        const b = box.querySelector('.trt-body'); if (b) b.scrollTop = scroll;
+        if (keep.key !== undefined) { const ki = box.querySelector('[data-keyinput]'); if (ki) ki.value = keep.key; }
+        if (keep.imp !== undefined) { const im = box.querySelector('[data-import]'); if (im) im.value = keep.imp; }
+        if (focusId) {
+          const sel = focusId === 'keyinput' ? '[data-keyinput]' : focusId.indexOf('goaloff:') === 0 ? '[data-goaloff="' + focusId.slice(8) + '"]' : '[data-set="' + focusId + '"],[data-act="' + focusId + '"]';
+          const el = box.querySelector(sel); if (el && typeof el.focus === 'function') { try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); } }
+        }
+      }
+      applyPosition();
+    }
+    function applyPosition() {
+      if (!root || (drag && drag.moved)) return;
+      const u = Settings.get().ui;
+      const p = (u.corner === 'custom' && u.pos) ? u.pos : (PRESETS[u.corner] || PRESETS['top-right']);
+      const vw = window.innerWidth || 1024; const vh = window.innerHeight || 768;
+      const x = U.clamp(Math.round(p.x), 4, Math.max(4, vw - 48));
+      const y = U.clamp(Math.round(p.y), 4, Math.max(4, vh - 48));
+      const st = root.style;
+      st.left = 'auto'; st.right = 'auto'; st.top = 'auto'; st.bottom = 'auto';
+      st[p.h] = x + 'px'; st[p.v] = y + 'px';
+      st.setProperty('--trt-maxh', Math.max(180, vh - y - 8) + 'px');
+      // Keep the whole window on screen without changing the saved position.
+      const r = root.getBoundingClientRect();
+      if (r.width && r.height) {
+        if (p.h === 'left' && r.right > vw - 4) st.left = Math.max(4, vw - r.width - 4) + 'px';
+        if (p.h === 'right' && r.left < 4) st.right = Math.max(4, vw - r.width - 4) + 'px';
+        if (p.v === 'top' && r.bottom > vh - 4) st.top = Math.max(4, vh - r.height - 4) + 'px';
+        if (p.v === 'bottom' && r.top < 4) st.bottom = Math.max(4, vh - r.height - 4) + 'px';
+      }
+    }
+    function tick() {
+      if (!root || Settings.get().ui.state === 'hidden') return;
+      const now = Time.now();
+      root.querySelectorAll('[data-trt-cd]').forEach((el) => {
+        const txt = fmtCd(Number(el.getAttribute('data-trt-cd')) - now, el.getAttribute('data-fmt'), el.getAttribute('data-done'));
+        if (el.textContent !== txt) el.textContent = txt;
+      });
+      root.querySelectorAll('[data-trt-ago]').forEach((el) => { const txt = U.ago(now - Number(el.getAttribute('data-trt-ago'))); if (el.textContent !== txt) el.textContent = txt; });
+      root.querySelectorAll('[data-trt-clock]').forEach((el) => { el.textContent = Time.fmtTct(now); });
+      const w = pct(Time.dayFraction());
+      root.querySelectorAll('.trt-day').forEach((el) => { if (el.style.width !== w) el.style.width = w; });
+    }
+
+    // ------------------------------------------------------------ actions
+    function setState(s) { if (s === 'hidden' && !canHide()) return; Settings.update((x) => { x.ui.state = s; }); Sync.broadcast('settings'); }
+    function setView(v) { view = v; notice = null; if (v !== 'settings') exportText = ''; requestRender('ui'); }
+    function arm(act) {
+      if (armed[act] && armed[act] > Date.now()) { delete armed[act]; return true; }
+      armed[act] = Date.now() + 4000; requestRender('ui');
+      setTimeout(() => { if (armed[act] && armed[act] <= Date.now()) { delete armed[act]; requestRender('ui'); } }, 4100);
+      return false;
+    }
+    function setNotice(where, kind, text) { notice = { where, kind, text }; requestRender('ui'); }
+    function saveKey() {
+      const input = root.querySelector('[data-keyinput]');
+      const k = ((input && input.value) || '').trim();
+      if (!/^[A-Za-z0-9]{16}$/.test(k)) { setNotice('key', 'bad', 'An API key is exactly 16 letters and numbers.'); return; }
+      Store.set('apikey', k);
+      if (input) input.value = '';
+      Api.clearHalt();
+      const m = Data.meta; m.keyFp = null; m.access = null; m.keyError = null; m.keyInfoAt = 0; m.logAccessDenied = false; Data.saveMeta();
+      setNotice('key', 'good', 'Key saved. Checking what it can access\u2026');
+      Sync.broadcast('key');
+      if (Sync.isLeader()) {
+        Service.refreshKeyInfo().then(() => {
+          const a = Data.meta.access;
+          if (Api.isHalted()) setNotice('key', 'bad', Api.isHalted().message);
+          else if (a) setNotice('key', 'good', 'Key accepted: ' + (a.type || 'unknown access') + (a.log ? ', activity log included.' : '.'));
+          else setNotice('key', 'bad', 'Could not check the key: ' + ((Data.meta.keyError && Data.meta.keyError.message) || 'unknown error'));
+          Service.forceRefresh(0);
+        });
+      }
+    }
+    function removeKey() {
+      if (!arm('remove-key')) return;
+      Store.del('apikey'); Api.clearHalt();
+      const m = Data.meta; m.keyFp = null; m.access = null; m.keyError = null; m.keyInfoAt = 0; Data.saveMeta();
+      setNotice('key', 'good', hasPdaKey() ? 'Key removed. The TornPDA key will be used.' : 'Key removed. The tracker has stopped making requests.');
+      Sync.broadcast('key');
+    }
+    function retryKey() {
+      Api.clearHalt();
+      const m = Data.meta; m.keyInfoAt = 0; m.keyError = null; m.keyFp = null; Data.saveMeta();
+      Sync.broadcast('key');
+      if (Sync.isLeader()) Service.tick();
+      requestRender('ui');
+    }
+    function buildExport() {
+      return JSON.stringify({
+        app: 'torn-daily-resource-tracker', format: 1, version: TRT_VERSION, exportedAt: new Date().toISOString(),
+        settings: Settings.get(), history: Data.hist, today: Data.day ? Data.summarize(Data.day) : null,
+      }, null, 2);
+    }
+    function copyExport() {
+      const ta = root.querySelector('[data-export]');
+      const done = () => setNotice('data', 'good', 'Copied.');
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(exportText).then(done, () => { if (ta) { ta.select(); } setNotice('data', 'warn', 'Select the text and copy it manually.'); }); return; }
+      } catch (e) { /* fall through */ }
+      if (ta) ta.select();
+      setNotice('data', 'warn', 'Select the text and copy it manually.');
+    }
+    function downloadExport() {
+      try {
+        const blob = new Blob([exportText], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'torn-daily-tracker-' + Time.currentDateKey() + '.json';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      } catch (e) { setNotice('data', 'warn', 'Download is not available here. Use Copy instead.'); }
+    }
+    function doImport() {
+      const ta = root.querySelector('[data-import]');
+      const raw = ta ? ta.value.trim() : '';
+      let obj = null;
+      try { obj = JSON.parse(raw); } catch (e) { setNotice('data', 'bad', 'That text is not valid exported data.'); return; }
+      if (!obj || obj.app !== 'torn-daily-resource-tracker') { setNotice('data', 'bad', 'This is not a TORN Daily Resource Tracker export.'); return; }
+      let days = 0;
+      if (obj.settings && typeof obj.settings === 'object') { const clean = Settings.sanitize(obj.settings); Settings.update((s) => { Object.assign(s, clean); }); }
+      if (Array.isArray(obj.history)) {
+        const map = new Map(Data.hist.map((h) => [h.date, h]));
+        for (const h of obj.history) {
+          if (h && typeof h.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(h.date) && !map.has(h.date)) { map.set(h.date, h); days++; }
+        }
+        Data.replaceHist(Array.from(map.values()).sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-90));
+      }
+      if (ta) ta.value = '';
+      Sync.broadcast('settings');
+      setNotice('data', 'good', 'Imported settings and ' + days + ' new day' + (days === 1 ? '' : 's') + ' of history.');
+    }
+    function act(name) {
+      switch (name) {
+        case 'expand': view = 'main'; setState('expanded'); break;
+        case 'collapse': view = 'main'; exportText = ''; setState('collapsed'); break;
+        case 'hide': view = 'main'; setState('hidden'); break;
+        case 'settings': view = 'settings'; notice = null; if (Settings.get().ui.state !== 'expanded') setState('expanded'); else requestRender('ui'); break;
+        case 'back': setView('main'); break;
+        case 'refresh':
+          if (Date.now() - manualAt < 10000) return;
+          manualAt = Date.now();
+          if (Sync.isLeader()) Service.forceRefresh(0); else Sync.broadcast('refresh');
+          requestRender('ui'); setTimeout(() => requestRender('ui'), 10100);
+          break;
+        case 'save-key': saveKey(); break;
+        case 'remove-key': removeKey(); break;
+        case 'retry-key': retryKey(); break;
+        case 'export': exportText = buildExport(); notice = null; requestRender('ui'); break;
+        case 'copy-export': copyExport(); break;
+        case 'download-export': downloadExport(); break;
+        case 'import': doImport(); break;
+        case 'reset-history':
+          if (!arm('reset-history')) return;
+          Data.resetHistory();
+          Data.ensureDay(Time.currentDateKey(), Sync.isLeader() && Time.trusted());
+          Sync.broadcast('reset');
+          if (Sync.isLeader()) Service.forceRefresh(0);
+          setNotice('data', 'good', "History cleared. Today's numbers are being rebuilt from Torn.");
+          break;
+        case 'reset-settings':
+          if (!arm('reset-settings')) return;
+          Settings.reset(); Sync.broadcast('settings');
+          setNotice('data', 'good', 'Settings reset to defaults.');
+          break;
+        case 'reset-position': Settings.update((s) => { s.ui.corner = 'top-right'; s.ui.pos = null; }); Sync.broadcast('settings'); break;
+        default: break;
+      }
+    }
+    function setPath(obj, path, val) {
+      const parts = path.split('.'); let o = obj;
+      for (let i = 0; i < parts.length - 1; i++) o = o[parts[i]];
+      o[parts[parts.length - 1]] = val;
+    }
+
+    // ------------------------------------------------------------ events
+    function onClick(e) {
+      if (Date.now() < suppressClickUntil) { e.preventDefault(); e.stopPropagation(); return; }
+      const t = e.target;
+      const a = t.closest ? t.closest('[data-act]') : null;
+      if (a && root.contains(a)) { e.preventDefault(); if (!a.disabled) act(a.getAttribute('data-act')); return; }
+      if (t.closest && t.closest('.trt-tile')) { e.preventDefault(); act('expand'); }
+    }
+    function onChange(e) {
+      const el = e.target;
+      if (!el || !root.contains(el)) return;
+      if (el.hasAttribute('data-goaloff')) {
+        const k = el.getAttribute('data-goaloff');
+        Settings.update((s) => { s.goals[k] = el.checked ? null : DEFAULT_SETTINGS.goals[k]; });
+        Sync.broadcast('settings');
+        return;
+      }
+      const path = el.getAttribute('data-set');
+      if (!path) return;
+      let val;
+      if (el.type === 'checkbox') val = el.checked;
+      else if (el.type === 'number') val = el.value === '' ? null : Number(el.value);
+      else val = el.value;
+      if (path === 'ui.scale' || path === 'refresh.coreSec') val = Number(val);
+      Settings.update((s) => { setPath(s, path, val); if (path === 'ui.corner' && val !== 'custom') s.ui.pos = null; });
+      Sync.broadcast('settings');
+    }
+    function isEditable(el) { return !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)); }
+    function onKeyDown(e) {
+      const t = e.target;
+      if (t && t.classList && t.classList.contains('trt-tile') && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); act('expand'); return; }
+      if (e.key === 'Escape' && Settings.get().ui.state === 'expanded' && !isEditable(t)) { e.preventDefault(); act('collapse'); }
+    }
+    function onGlobalKey(e) {
+      if (!(e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyD')) return;
+      if (isEditable(e.target)) return;
+      e.preventDefault();
+      const s = Settings.get().ui.state;
+      setState(s === 'hidden' ? 'collapsed' : (canHide() ? 'hidden' : 'collapsed'));
+    }
+    function onPointerDown(e) {
+      if (e.button !== undefined && e.button !== 0) return;
+      const handle = e.target.closest ? e.target.closest('[data-drag]') : null;
+      if (!handle || !root.contains(handle)) return;
+      if (e.target.closest('button, a, input, select, textarea, label')) return;
+      const r = root.getBoundingClientRect();
+      drag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, left: r.left, top: r.top, w: r.width, h: r.height, moved: false };
+      try { if (handle.setPointerCapture && e.pointerId !== undefined) handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      window.addEventListener('pointermove', onPointerMove, { passive: false });
+      window.addEventListener('pointerup', onPointerUp);
+      window.addEventListener('pointercancel', onPointerUp);
+    }
+    function onPointerMove(e) {
+      if (!drag || (drag.id !== undefined && e.pointerId !== undefined && e.pointerId !== drag.id)) return;
+      const dx = e.clientX - drag.sx; const dy = e.clientY - drag.sy;
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 6) return;
+      drag.moved = true;
+      root.classList.add('trt-dragging');
+      const vw = window.innerWidth || 1024; const vh = window.innerHeight || 768;
+      const st = root.style;
+      st.right = 'auto'; st.bottom = 'auto';
+      st.left = U.clamp(drag.left + dx, 4, Math.max(4, vw - drag.w - 4)) + 'px';
+      st.top = U.clamp(drag.top + dy, 4, Math.max(4, vh - Math.min(drag.h, vh - 8) - 4)) + 'px';
+      if (e.cancelable) e.preventDefault();
+    }
+    function onPointerUp() {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
+      if (!drag) return;
+      const d = drag; drag = null;
+      root.classList.remove('trt-dragging');
+      if (!d.moved) return;
+      suppressClickUntil = Date.now() + 350;
+      const r = root.getBoundingClientRect();
+      const vw = window.innerWidth || 1024; const vh = window.innerHeight || 768;
+      const h = (r.left + r.width / 2) > vw / 2 ? 'right' : 'left';
+      const v = (r.top + r.height / 2) > vh / 2 ? 'bottom' : 'top';
+      const x = Math.max(4, Math.round(h === 'left' ? r.left : vw - r.right));
+      const y = Math.max(4, Math.round(v === 'top' ? r.top : vh - r.bottom));
+      Settings.update((s) => { s.ui.corner = 'custom'; s.ui.pos = { h, v, x, y }; });
+      Sync.broadcast('settings');
+    }
+    let resizeTimer = null;
+    function onResize() { clearTimeout(resizeTimer); resizeTimer = setTimeout(applyPosition, 120); }
+
+    function mount() {
+      if (document.getElementById('trt-root')) return false;
+      const style = document.createElement('style');
+      style.id = 'trt-style';
+      style.textContent = CSS;
+      (document.head || document.documentElement).appendChild(style);
+      root = document.createElement('div');
+      root.id = 'trt-root';
+      document.body.appendChild(root);
+      root.addEventListener('click', onClick);
+      root.addEventListener('change', onChange);
+      root.addEventListener('keydown', onKeyDown);
+      root.addEventListener('pointerdown', onPointerDown);
+      window.addEventListener('resize', onResize);
+      document.addEventListener('keydown', onGlobalKey);
+      render(new Set(['state']));
+      return true;
+    }
+    function registerMenu() {
+      if (!hasMenu) return;
+      try {
+        GM_registerMenuCommand('Show tracker', () => { if (Settings.get().ui.state === 'hidden') setState('collapsed'); });
+        GM_registerMenuCommand('Hide tracker', () => setState('hidden'));
+        GM_registerMenuCommand('Expand tracker', () => { view = 'main'; setState('expanded'); });
+        GM_registerMenuCommand('Open settings', () => { view = 'settings'; setState('expanded'); });
+        GM_registerMenuCommand('Reset position', () => { Settings.update((s) => { s.ui.corner = 'top-right'; s.ui.pos = null; }); Sync.broadcast('settings'); });
+      } catch (e) { /* menu not supported */ }
+    }
+    return {
+      mount, render, requestRender, tick, registerMenu, canHide, setState, setView, applyPosition,
+      get view() { return view; }, get root() { return root; },
+    };
+  })();
+  // ===========================================================================
+  // BOOT
+  // ===========================================================================
+  let bootStartedAt = 0;
+
+  // A visible tab takes over API duty if the leader tab stopped updating.
+  function watchdog() {
+    if (Sync.isLeader() || document.hidden || !Api.getKey() || Api.isHalted()) return;
+    Data.reload();
+    const last = Data.meta.lastCoreAt || 0;
+    const limit = 3 * Settings.get().refresh.coreSec * 1000 + 90000;
+    if ((last && Date.now() - last > limit) || (!last && Date.now() - bootStartedAt > 120000)) Sync.takeOver();
+  }
+
+  // Switches the daily ledger exactly when the TCT date changes. Game-state
+  // values (refills, casino, cooldowns) are then refreshed from Torn instead
+  // of being assumed.
+  function checkRollover() {
+    const k = Time.currentDateKey();
+    const leader = Sync.isLeader() && Time.trusted();
+    if (Data.day && Data.day.date === k && !(Data.ephemeral && leader)) return false;
+    if (!Data.ensureDay(k, leader)) return false;
+    if (leader) {
+      Sync.broadcast('day');
+      Service.forceRefresh(3000);
+      Service.forceRefresh(35000); // first counter read that is certainly after New Day (Torn may cache up to 30s)
+    }
+    UI.requestRender('data');
+    return true;
+  }
+
+  function boot() {
+    if (!document.body) { setTimeout(boot, 50); return; }
+    if (document.getElementById('trt-root')) return;
+    bootStartedAt = Date.now();
+    Api.restoreHalt();
+    Time.restore(Data.meta);
+    Data.ensureDay(Time.currentDateKey(), false);
+    // A hidden tracker must stay reachable where no userscript menu exists.
+    if (Settings.get().ui.state === 'hidden' && !UI.canHide()) Settings.update((s) => { s.ui.state = 'collapsed'; }, { silent: true });
+    if (!UI.mount()) return;
+
+    Settings.onChange(() => UI.requestRender('settings'));
+    Theme.watch(() => UI.requestRender('theme'));
+    Api.onChange(() => UI.requestRender('data'));
+    Service.onUpdate(() => UI.requestRender('data'));
+    Pages.onChange(() => UI.requestRender('data'));
+    Time.onJump(() => { if (Sync.isLeader()) Service.forceRefresh(0); });
+
+    Sync.onLeader((isLeader) => {
+      if (isLeader) {
+        Data.reload();
+        Data.ensureDay(Time.currentDateKey(), Time.trusted());
+        Service.start();
+        Service.forceRefresh(0);
+      }
+      UI.requestRender('data');
+    });
+    Sync.onMessage((msg) => {
+      if (msg.type === 'settings') Settings.reload();
+      if (msg.type === 'key') Api.restoreHalt();
+      if (msg.type === 'reset') { Data.resetHistory(); Data.ensureDay(Time.currentDateKey(), Sync.isLeader() && Time.trusted()); }
+      Data.reload();
+      if (Sync.isLeader() && (msg.type === 'refresh' || msg.type === 'key' || msg.type === 'reset')) Service.forceRefresh(0);
+      UI.requestRender(msg.type === 'settings' ? 'settings' : 'data');
+    });
+
+    UI.registerMenu();
+    Sync.start();
+
+    let n = 0;
+    setInterval(() => {
+      n++;
+      Time.checkJump();
+      Pages.check();
+      checkRollover();
+      if (!document.hidden) UI.tick();
+      if (n % 10 === 0 && !document.hidden) UI.requestRender('data');
+      if (n % 30 === 0) watchdog();
+    }, 1000);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) { Time.checkJump(); checkRollover(); UI.requestRender('data'); }
+    });
+    Pages.check();
+  }
+
+  boot();
+})();
